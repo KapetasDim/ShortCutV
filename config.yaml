@@ -1,0 +1,122 @@
+# UI sizing profiles for video_editor. "1080p" matches the app's original
+# hardcoded sizes; "4k" is every pixel/font/geometry value at 150% -- EXCEPT
+# Entry/Combobox `width=` values, which are character counts, not pixels, and
+# are left as literals in code (growing the font already widens their pixel
+# footprint; growing the character count on top would compound it further).
+profiles:
+  1080p:
+    # Fonts (point size)
+    font_xs: 8
+    font_sm: 9
+    font_md: 10
+    font_lg: 11
+    font_xl: 14
+
+    # Spacing scale (px), used for padx/pady
+    space_xxs: 2
+    space_xs: 4
+    space_sm: 6
+    space_md: 8
+    space_lg: 10
+    space_xl: 12
+    space_xxl: 16
+    space_xxxl: 20
+
+    # RangeSlider (widgets.py)
+    range_slider_height: 44
+    range_slider_track_y: 20
+    range_slider_track_h: 6
+    range_slider_handle_r: 9
+    range_slider_hit_tolerance: 14
+
+    # Scrubber (widgets.py)
+    scrubber_height: 32
+    scrubber_track_y: 14
+    scrubber_track_h: 6
+    scrubber_handle_r: 8
+
+    # CropCanvas (widgets.py)
+    crop_max_display_h: 480
+    crop_line_hit: 8
+
+    # InlineColorPicker (widgets.py)
+    color_picker_sq: 150
+    color_picker_hue_h: 18
+    color_picker_swatch: 36
+    color_picker_marker_r: 5
+
+    # TimelineCanvas (timeline_tab.py)
+    timeline_block_w: 140
+    timeline_block_h: 90
+    timeline_gap_w: 110
+    timeline_pad: 12
+    timeline_edit_r: 8
+
+    # Scrollable list / preview-frame heights & widths
+    scroll_default_h: 200
+    crop_checklist_h: 220
+    crop_checklist_w: 280
+    trim_preview_h: 280
+    library_list_h: 180
+    text_overlay_list_h: 80
+    text_overlay_col_w: 920
+    preview_max_w_text: 420
+    preview_max_w_image: 360
+    wraplength_folder_label: 480
+
+    # Window geometry
+    app_window_geometry: "1100x700"
+
+  4k:
+    font_xs: 12
+    font_sm: 14
+    font_md: 15
+    font_lg: 17
+    font_xl: 21
+
+    space_xxs: 3
+    space_xs: 6
+    space_sm: 9
+    space_md: 12
+    space_lg: 15
+    space_xl: 18
+    space_xxl: 24
+    space_xxxl: 30
+
+    range_slider_height: 66
+    range_slider_track_y: 30
+    range_slider_track_h: 9
+    range_slider_handle_r: 14
+    range_slider_hit_tolerance: 21
+
+    scrubber_height: 48
+    scrubber_track_y: 21
+    scrubber_track_h: 9
+    scrubber_handle_r: 12
+
+    crop_max_display_h: 720
+    crop_line_hit: 12
+
+    color_picker_sq: 225
+    color_picker_hue_h: 27
+    color_picker_swatch: 54
+    color_picker_marker_r: 8
+
+    timeline_block_w: 210
+    timeline_block_h: 135
+    timeline_gap_w: 165
+    timeline_pad: 18
+    timeline_edit_r: 12
+
+    scroll_default_h: 300
+    crop_checklist_h: 330
+    crop_checklist_w: 420
+    trim_preview_h: 420
+    library_list_h: 270
+    text_overlay_list_h: 120
+    text_overlay_col_w: 1380
+    preview_max_w_text: 630
+    preview_max_w_image: 540
+    wraplength_folder_label: 720
+
+    app_window_geometry: "1650x1050"

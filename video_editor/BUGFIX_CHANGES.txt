@@ -1,0 +1,280 @@
+video_editor bug sweep -- fixes applied 2026-07-19
+====================================================
+Purpose: this file is a backtracking aid. If something breaks after this
+change set, find the relevant section below, see exactly what changed and
+why, and revert just that piece (all changes are localized and independent
+of each other except where noted).
+
+Verification performed: py_compile on every edited file (syntax-level only,
+no runtime testing was done -- please smoke-test crop batches, timeline
+add/remove/reorder, and each editor's Bake Preview before relying on this).
+
+
+1. ffmpeg_ops.py
+-----------------
+- probe_video(): wrapped the ffprobe subprocess.run() and the json.loads()
+  of its output in try/except. Missing ffprobe binary or unparseable output
+  now logs via log.exception(...) before re-raising (same exception
+  propagates, just with a log entry -- callers' behavior on failure is
+  unchanged).
+- probe_video(): added a log.warning() when no video stream is found in the
+  probed file (previously silently produced width=0/height=0, which fed bad
+  negative crop dimensions into ffmpeg further downstream with no
+  explanation of the root cause).
+- _run_with_progress(): wrapped the ffmpeg Popen() call in try/except
+  OSError. If the ffmpeg binary is missing/not on PATH, this now logs and
+  returns False (treated the same as an ffmpeg failure) instead of raising
+  an uncaught exception that silently killed whatever background thread
+  called it (render/export/bake), leaving the UI stuck.
+- export_frame(), extract_thumbnail(), extract_frame(): same OSError guard
+  added around each's subprocess.run() call. extract_thumbnail/extract_frame
+  return b"" on failure (matching their existing non-zero-exit-code
+  behavior); export_frame returns False.
+- run_crop_resize(): SIGNATURE CHANGED. Previously took `crop:
+  tuple[int,int,int,int]` (absolute pixel offsets from the previewed file).
+  Now takes `crop_fractions: tuple[float,float,float,float]` (0..1 of each
+  input file's own width/height) and computes per-file pixel crop from that
+  file's own probed dimensions. See item 6 (crop_resize_tab.py) for why --
+  this was a real correctness bug, not just a logging gap. Only caller is
+  crop_resize_tab.py._run(), which was updated to match.
+
+2. image_render.py
+-------------------
+- render_image_clip_sequence(): wrapped Image.open(clip.path) in try/except
+  (OSError, ValueError). Logs and re-raises. Previously a deleted/moved/
+  corrupted image-clip source killed the timeline render thread with no log
+  entry -- the render just silently stopped.
+
+3. text_render.py
+------------------
+- render_text_frame(): wrapped ImageFont.truetype(...) in try/except
+  OSError. Logs which font family/path failed, then re-raises. Previously a
+  missing/corrupt font file died deep inside the per-frame render loop with
+  no log entry.
+
+4. fonts_catalog.py
+--------------------
+- Added a module logger (log = get_logger()).
+- font_path(): when the requested font family isn't in FONT_CATALOG (e.g. a
+  project file referencing a font that was later removed from the catalog),
+  this now logs a warning naming both the missing family and the fallback
+  it silently substituted. Previously this substitution was completely
+  silent -- text would render in the wrong font with no diagnostic trail.
+- font_path(): also now logs a warning if the resolved regular-weight font
+  file doesn't actually exist on disk (previously only checked by
+  list_available_fonts(), not by font_path() itself, so a stale/incomplete
+  fonts/ directory could still hand back a path to a nonexistent file).
+
+5. app.py
+----------
+- AppState.save(): wrapped in try/except OSError (matching AppState.load(),
+  which already had this). A locked file, full disk, or permission error on
+  exit now logs via log.exception(...) instead of raising out of the Tk
+  WM_DELETE_WINDOW handler and potentially blocking the window from
+  closing / producing an unhandled-exception dialog.
+- Added _cleanup_stale_bake_temp_dirs(), called once at the top of
+  App.__init__ before any editor tab exists. Sweeps
+  %TEMP%/video_editor_image_preview, video_editor_sound_preview, and
+  video_editor_text_preview, deleting any leftover files. These dirs hold
+  "baked" preview .mp4s from image_clip_editor.py / sound_clip_editor.py /
+  text_overlay_editor.py; each editor only deletes its OWN bake file, and
+  only on its own next-bake or teardown() (Apply/Close) -- if the app
+  crashed or was killed mid-session, those files were orphaned there
+  forever. Deliberately done once at startup (not per-editor-open) so it
+  can never race a currently-open editor's live bake file.
+
+6. crop_resize_tab.py  (paired with ffmpeg_ops.py + widgets.py changes)
+-------------------------------------------------------------------------
+- THE MAIN CACHE/CORRECTNESS BUG: the crop box is drawn against only the
+  FIRST selected file's preview frame (_load_preview_frame loads
+  self._files[0]). The old code read the crop as absolute pixels
+  (get_crop()) and applied those same pixel offsets to every file in the
+  batch via ffmpeg_ops.run_crop_resize / _crop_resize_image. If the batch's
+  files don't all share the previewed file's exact resolution, this
+  silently produced a wrong crop (or, if the offsets exceeded a smaller
+  file's dimensions, ffmpeg would likely fail outright) for every file
+  except the previewed one.
+  FIX: _run() and _crop_resize_image() now use crop *fractions*
+  (self._crop_canvas.get_crop_fractions(), see widgets.py) instead of
+  absolute pixels. Each file's crop is now computed relative to ITS OWN
+  width/height, so a proportionally-equivalent crop is applied regardless
+  of that file's actual resolution.
+- _run()'s background worker (`run()`): wrapped both the video batch call
+  and each per-image call in try/except. Previously an exception from
+  ffmpeg_ops.run_crop_resize (rare) or _crop_resize_image (any corrupt/
+  unreadable image, or a crop rect that ends up degenerate for a smaller
+  file) killed the whole background thread silently -- remaining files in
+  the batch were never processed, and the UI stayed on "Running..."
+  forever with no indication anything went wrong. Now failures are caught
+  per-file/per-batch, logged, and the final status label reports how many
+  of the selected files actually succeeded plus which ones failed.
+- _load_preview_frame(): wrapped in try/except. A corrupt/unreadable first
+  file previously raised out of a UI callback path with no log entry.
+
+7. widgets.py
+--------------
+- CropCanvas: added get_crop_fractions() (mirrors the existing
+  get_crop_fractions() already present on the unrelated VideoCropOverlay
+  class) returning the crop box as 0..1 fractions of the loaded preview
+  image's own dimensions. This is what crop_resize_tab.py now uses instead
+  of get_crop()'s absolute pixels -- see item 6. get_crop() itself is
+  unchanged and still used elsewhere (e.g. the live label).
+
+8. timeline_tab.py
+--------------------
+- THE OTHER MAIN CACHE BUG: TimelineCanvas._thumbs was a dict keyed by list
+  POSITION, not clip identity. Deleting or reordering a clip shifts every
+  later clip's true index without updating/invalidating what's cached at
+  that index, so after a delete, the thumbnail that belonged to clip N+1
+  kept showing at slot N (now occupied by a different clip) until
+  something happened to re-fetch it -- which, for _on_remove, nothing did.
+  FIX: TimelineCanvas.set_clips() now diffs the incoming clip list against
+  the previous one BY OBJECT IDENTITY (in-place edits like trim/crop mutate
+  the same TimelineClip object, so an untouched clip keeps the same object
+  across calls -- this is safe to rely on without adding an id field to the
+  dataclass / touching the project file format). From the first index where
+  the object no longer matches onward, cached thumbnails are dropped so
+  those slots fall back to the placeholder instead of showing a wrong
+  frame.
+  _on_remove() was also updated to re-request thumbnails for every clip
+  after the removed index (mirroring what _on_reorder already did for a
+  reorder) -- without this, the now-correctly-invalidated slots would just
+  stay blank forever instead of getting refreshed.
+- redraw(): narrowed a bare `except Exception: pass` around
+  destroying leftover embedded gap-control widgets down to `except
+  tk.TclError: pass`. The TclError case (widget already destroyed) is the
+  actual expected/intentional case; any other exception type there was
+  previously being silently swallowed too.
+- _add_selected(): wrapped the Image.open()/ffmpeg_ops.probe_video() calls
+  used to add a new clip in try/except (this file already wrapped the
+  equivalent call in _add_sound_from_library with logging -- this path was
+  the odd one out). A corrupt/deleted library file previously raised out of
+  a button click handler with no log entry; now it's logged and the status
+  label tells the user the add failed.
+- _request_thumbnail()'s background thread: wrapped the
+  Image.open()/ffmpeg_ops.extract_thumbnail() call in try/except. Previously
+  an exception here killed the daemon thread silently -- no log, no
+  fallback beyond the permanent placeholder block. Now it's logged with the
+  clip index and path.
+- _cancel_render(): wrapped proc.terminate() in try/except OSError, closing
+  a TOCTOU race where the render process can exit between the poll() check
+  and the terminate() call.
+
+9. image_clip_editor.py
+--------------------------
+- _bake_preview()'s background thread: wrapped the
+  ffmpeg_ops.render_image_clip_preview() call in try/except. Previously an
+  exception (as opposed to a normal ok=False failure) killed the thread
+  before self.after(0, ...) could run _on_bake_done, leaving the "Baking..."
+  button state and progress bar stuck forever with no error shown. Now it's
+  logged and treated as ok=False, which _on_bake_done already handles
+  (re-enables the button, shows "Bake failed", cleans up the temp file).
+  (_load_source() and _delete_bake_file() already had adequate try/except
+  in this file -- left unchanged.)
+
+10. sound_clip_editor.py
+--------------------------
+- _default_duration(): the bare `except Exception: pass` was logging
+  nothing at all, unlike every other exception handler in this codebase.
+  Now logs via log.exception(...) before falling back to the 5.0s default,
+  so a corrupt/unreadable audio file's root cause is actually discoverable
+  in the log instead of just silently defaulting.
+- _bake_preview()'s background thread: same fix as image_clip_editor.py
+  item 9 -- wrapped ffmpeg_ops.render_sound_clip_preview() in try/except so
+  an exception doesn't leave the UI stuck on "Baking...".
+
+11. text_overlay_editor.py
+-----------------------------
+- _bake_preview()'s background thread: same fix as items 9/10 -- wrapped
+  ffmpeg_ops.render_text_overlay_preview() in try/except.
+- NOT fixed (noted for awareness, deliberately low priority): the font
+  list shown in this editor's dropdown (fonts_catalog.list_available_fonts())
+  is fetched once when the tab is built and never refreshed for the rest of
+  that tab's lifetime. If fonts/ changes on disk while the tab is open this
+  won't be reflected until the tab is rebuilt. Very low-probability
+  scenario (fonts/ is a bundled app resource, not user-editable in normal
+  use) and fixing it well would mean re-scanning disk on every dropdown
+  open, which felt like overkill relative to the risk -- flagging instead
+  of fixing. The bigger risk (a project referencing a font no longer in the
+  catalog at all) is now covered by fonts_catalog.py's new warning logging
+  (item 4).
+
+12. native_dialog.py
+-----------------------
+- terminate_all_dialog_processes(): proc.kill() is now followed by
+  proc.wait(timeout=5) to actually reap the process, instead of leaving its
+  exit status unconsumed (which could surface as ResourceWarning/OSError
+  noise and left zombie-ish Popen objects around).
+- _run_worker(): the 300s proc.communicate(timeout=...) call previously
+  just logged and gave up on subprocess.TimeoutExpired WITHOUT KILLING THE
+  CHILD (Python does not kill it for you on timeout) -- worse, the process
+  was then dropped from _active_procs right after in the `finally`, so
+  terminate_all_dialog_processes() at app-shutdown could no longer find it
+  either. A hung dialog worker (e.g. a stuck COM dialog, or a slow network
+  drive under askdirectory) would survive as an orphaned python.exe
+  indefinitely, even after the main app closed.
+  FIX: on TimeoutExpired, explicitly proc.kill() and reap it (with its own
+  short timeout, logged if that also fails) before returning.
+- _run_worker(): stderr from the worker subprocess was captured but
+  discarded (`_stderr` was never used). Now, if the worker exits non-zero,
+  stderr is logged via log.warning(...) (truncated to the last 1000 chars).
+  Previously a worker-side crash was completely indistinguishable from the
+  user clicking Cancel (both produce empty stdout) -- see also
+  _dialog_worker.py item 13.
+
+13. _dialog_worker.py
+------------------------
+- main(): wrapped the three filedialog.ask*() calls in try/except...finally.
+  An uncaught exception here (bad filetypes tuple, Tcl error, etc.) now
+  still stops the window-repositioning background thread (stop_event.set()
+  moved into a finally) and then propagates normally, producing a non-zero
+  exit code + traceback on stderr -- which native_dialog.py's _run_worker
+  now actually captures and logs (item 12). Previously this failure mode
+  was silent and looked exactly like a user Cancel from the caller's side.
+
+14. player.py
+----------------
+- Added self._generation, an int bumped on every load() and terminate()
+  call.
+- THE RACE: _wait_for_duration() polls self._player.duration every 100ms
+  via a recursive root.after(100, ...) closure, retrying until it becomes
+  positive. If load() was called again before an earlier call's polling
+  loop resolved (e.g. the user rapidly switches clips/re-bakes), the OLD
+  closure kept polling -- but self._player had by then been reassigned to
+  the NEW mpv instance, so the stale closure's `if self._player is None`
+  guard no longer caught it. It would keep polling the new player and could
+  eventually fire the OLD (wrong) on_ready callback once the new clip's
+  duration resolved, potentially wiring UI state to the wrong clip.
+  FIX: _wait_for_duration() now takes the generation number captured at the
+  start of its owning load() call and bails out immediately if
+  self._generation has since changed (i.e. a newer load() or an explicit
+  terminate() happened). terminate() now also bumps the generation, so a
+  poll loop that's still in flight when someone explicitly stops playback
+  won't fire its on_ready afterward either.
+- ALSO FIXED: _wait_for_duration() previously had no failure path at all --
+  if duration never became valid (corrupt file, unsupported codec), it
+  polled every 100ms forever with nothing logged and on_ready never firing
+  (anything waiting on that callback -- e.g. a bake-preview player's
+  "unlock the scrubber" step -- just hung silently). It now gives up after
+  100 attempts (~10s) and logs an error naming the file that never
+  resolved.
+- load(): wrapped the mpv.MPV(...) construction and .play() call in
+  try/except. Previously a failure here (bad wid, GPU/driver issue,
+  malformed path) propagated unhandled out of a Tk callback, and could
+  leave self._player partially assigned with no cleanup. Now logged, and
+  self._player is reset to None on failure so the object is left in a
+  clean, retryable state.
+
+
+Known findings NOT addressed in this pass (flagged, not fixed)
+------------------------------------------------------------------
+- text_overlay_editor.py font-list staleness -- see item 11, judged too
+  low-risk/low-value to justify the added disk-scan-on-every-dropdown-open
+  complexity.
+- General: none of these fixes add new UI-facing error dialogs beyond the
+  status-label text already used in a few spots (e.g. crop_resize_tab.py,
+  timeline_tab.py._add_selected). Most failures now surface as a clear
+  entry in the app's log (console + the in-app log tab via
+  logging_config.TkTextHandler) rather than a modal error box -- consistent
+  with how the rest of the codebase already reports failures (log.exception
+  + a status label, not messagebox popups).

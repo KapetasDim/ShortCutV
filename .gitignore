@@ -1,0 +1,12 @@
+# Rebuilt from libmpv-2.dll.xz on first launch (raw DLL is >100MB, too big for GitHub)
+/libmpv-2.dll
+
+__pycache__/
+*.pyc
+
+# Per-machine app state (last-used folders)
+video_editor/.state.json
+
+# Virtual environments
+my_venv/
+.venv/
