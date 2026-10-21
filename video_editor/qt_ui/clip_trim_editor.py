@@ -1,23 +1,24 @@
 from __future__ import annotations
 
-import threading
 from pathlib import Path
 from typing import Callable, Optional
 
 from PySide6.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QProgressBar, QPushButton,
                                 QVBoxLayout, QWidget)
 
-from .. import ffmpeg_ops
 from ..crop_box import ASPECT_RATIO_LABELS, ASPECT_RATIO_VALUES
 from ..logging_config import get_logger
 from ..project import TimelineClip
+from . import media_info
 from .crop_widgets import VideoCropOverlay
 from .dialogs import ask_save_filename
 from .icons import icon
+from .job_queue import HIGH
 from .player import SharedPlayer
 from .theme import COLORS
-from .util import connect_button, run_on_ui
+from .util import connect_button
 from .widgets import RangeSlider, fmt_time
+from .worker_client import WorkerJob
 
 log = get_logger()
 
@@ -36,22 +37,17 @@ class ClipTrimEditor(QWidget):
         self.on_close = on_close
         self.player = SharedPlayer(self)
         self._crop_overlay: Optional[VideoCropOverlay] = None
+        self._jobs: list[WorkerJob] = []
 
-        try:
-            # Shortened from the usual 20s: this clip was already probed
-            # successfully once when it was added (see app.py._add_clip), so
-            # a slow/corrupt result here almost always means the file
-            # changed/vanished since -- no reason to block the editor open
-            # for as long as a first-ever probe would warrant.
-            probe = ffmpeg_ops.probe_video(clip.path, timeout=3)
-            self._src_w = probe.width or 1
-            self._src_h = probe.height or 1
-        except Exception:
-            # probe_video()/ffprobe already logged the specific failure --
-            # fall back to a plausible size instead of crashing the editor
-            # open. Crop math will be off vs. the real source dimensions
-            # until the file is reachable again, but the widget stays usable.
-            self._src_w, self._src_h = 1920, 1080
+        # Source size comes from the shared probe cache -- normally already
+        # filled when the clip was added. If not (file changed since), probe
+        # asynchronously and fix the crop overlay up when it lands, instead
+        # of blocking the GUI thread on ffprobe while the editor opens.
+        info = media_info.cached(clip.path)
+        self._src_w = (info.width if info else 0) or 1920
+        self._src_h = (info.height if info else 0) or 1080
+        if info is None:
+            media_info.request(clip.path, self._on_source_probed, priority=HIGH)
         self._crop_top = clip.crop_top
         self._crop_bottom = clip.crop_bottom
         self._crop_left = clip.crop_left
@@ -182,6 +178,15 @@ class ClipTrimEditor(QWidget):
         self._crop_lbl.setText(f"top={self._crop_top}px  bottom={self._crop_bottom}px  "
                                 f"left={self._crop_left}px  right={self._crop_right}px  ->  {out_w}x{out_h}")
 
+    def _on_source_probed(self, info: media_info.MediaInfo):
+        if self._crop_overlay is None or not (info.width and info.height):
+            return
+        self._src_w, self._src_h = info.width, info.height
+        self._crop_overlay.set_crop_fractions(
+            self._crop_top / self._src_h, self._crop_bottom / self._src_h,
+            self._crop_left / self._src_w, self._crop_right / self._src_w)
+        self._update_crop_label()
+
     # ------------------------------------------------------------- loading --
 
     def _on_ready(self):
@@ -260,16 +265,23 @@ class ClipTrimEditor(QWidget):
     def _run_export_clip(self, in_s: float, out_s: float, out_path: Path):
         self._progress.setValue(0)
         self._status_lbl.setText("Exporting...")
+        self._start_job("export_clip", {"path": str(self.clip.path), "in_s": in_s, "out_s": out_s,
+                                        "output": str(out_path)}, out_path)
 
-        def on_progress(frac, _label):
-            run_on_ui(lambda: self._progress.setValue(int(frac * 100)))
+    def _start_job(self, kind: str, params: dict, out_path: Path):
+        job = WorkerJob(kind, params, parent=self)
+        self._jobs.append(job)
+        job.progress.connect(lambda frac, _msg: self._progress.setValue(int(frac * 100)))
+        job.finished.connect(lambda result: self._on_job_done(job, out_path, result))
+        job.start()
 
-        def run():
-            ok = ffmpeg_ops.export_clip(self.clip.path, in_s, out_s, out_path, on_progress)
-            run_on_ui(lambda: self._status_lbl.setText(
-                f"Saved: {out_path.name}" if ok else "Export failed (see console)"))
-
-        threading.Thread(target=run, daemon=True).start()
+    def _on_job_done(self, job: WorkerJob, out_path: Path, result: dict):
+        if job in self._jobs:
+            self._jobs.remove(job)
+        if result.get("cancelled"):
+            return
+        self._status_lbl.setText(f"Saved: {out_path.name}" if result.get("ok")
+                                 else "Export failed (see console)")
 
     def _export_frame(self):
         d = self.player.duration_s
@@ -291,13 +303,8 @@ class ClipTrimEditor(QWidget):
 
     def _run_export_frame(self, pos_s: float, out_path: Path):
         self._status_lbl.setText("Exporting frame...")
-
-        def run():
-            ok = ffmpeg_ops.export_frame(self.clip.path, pos_s, out_path)
-            run_on_ui(lambda: self._status_lbl.setText(
-                f"Saved: {out_path.name}" if ok else "Export failed (see console)"))
-
-        threading.Thread(target=run, daemon=True).start()
+        self._start_job("export_frame", {"path": str(self.clip.path), "pos_s": pos_s,
+                                         "output": str(out_path)}, out_path)
 
     # --------------------------------------------------------------- close --
 
@@ -307,7 +314,8 @@ class ClipTrimEditor(QWidget):
 
     def teardown(self):
         """Idempotent cleanup of non-Qt resources (the mpv subprocess, the
-        floating crop-overlay window)."""
+        floating crop-overlay window). A running export keeps going -- it
+        writes to a file the user picked, independent of this editor."""
         self.player.terminate()
         if self._crop_overlay is not None:
             self._crop_overlay.destroy()

@@ -2,22 +2,23 @@
 (proxy or final), and hosts the Build Preview / Render Final Video actions."""
 from __future__ import annotations
 
-import threading
+import uuid
 from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QComboBox, QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton, QVBoxLayout, QWidget
 
-from .. import ffmpeg_ops
 from ..logging_config import get_logger
-from ..project import TimelineClip
+from ..project import project_to_dict
+from . import media_info
 from .dialogs import ask_save_filename
 from .icons import icon
 from .player import SharedPlayer
 from .theme import COLORS
-from .util import connect_button, run_on_ui
+from .util import connect_button
 from .widgets import Scrubber, fmt_time
+from .worker_client import WorkerJob
 
 log = get_logger()
 
@@ -28,14 +29,12 @@ class ProgramViewerPanel(QWidget):
     def __init__(self, preview_player: SharedPlayer, parent=None):
         super().__init__(parent)
         self.preview_player = preview_player
-        self._rendering = False
-        self._render_proc_holder: dict = {}
-        # "proxy" | "final" | None -- which render (if any) currently owns
-        # _render_proc_holder. Guards against a proxy Build and a final
-        # Render running concurrently (they'd race on the same ffmpeg
-        # progress/cancel state) and lets closeEvent find a live render to
-        # kill.
+        self._job: Optional[WorkerJob] = None
+        # "proxy" | "final" | None -- which render (if any) is in flight (or,
+        # for "final", waiting on its save dialog). Guards against a proxy
+        # Build and a final Render running concurrently.
         self._render_kind: Optional[str] = None
+        self._proxy_path: Optional[Path] = None  # currently loaded proxy file
         self.has_composed_preview = False
 
         layout = QVBoxLayout(self)
@@ -110,7 +109,7 @@ class ProgramViewerPanel(QWidget):
         self.preview_player.set_tick_callback(None)
 
     def stop_active_work(self):
-        if self._rendering:
+        if self._render_kind == "proxy":
             self._cancel_render()
         self.preview_player.pause()
         self.preview_player.suspend_polling()
@@ -143,19 +142,17 @@ class ProgramViewerPanel(QWidget):
         self._render(proxy=True)
 
     def _cancel_render(self):
-        self._render_proc_holder["cancelled"] = True
-        proc = self._render_proc_holder.get("proc")
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.terminate()
-            except OSError:
-                log.exception("Program viewer: failed to terminate render process")
-        self._rendering = False
+        job, self._job = self._job, None
+        if job is not None:
+            job.cancel()
         self._render_kind = None
-        self._build_btn.setText(" Build Preview")
-        self._build_btn.setProperty("variant", "violet")
-        self._restyle(self._build_btn)
+        self._set_build_button(building=False)
         self._status_lbl.setText("Cancelled.")
+
+    def _set_build_button(self, building: bool):
+        self._build_btn.setText(" Cancel" if building else " Build Preview")
+        self._build_btn.setProperty("variant", "danger" if building else "violet")
+        self._restyle(self._build_btn)
 
     @staticmethod
     def _restyle(widget):
@@ -193,86 +190,78 @@ class ProgramViewerPanel(QWidget):
         if not project.clips:
             self._status_lbl.setText("Timeline is empty.")
             return
-        out_path = self._tmp_dir / "proxy_preview.mp4"
-        if proxy:
-            # ffmpeg is about to overwrite this exact file; the preview
-            # player may still have it open (paused, not unloaded) from the
-            # last proxy render, which can make the overwrite fail or hand
-            # mpv a half-written file on Windows -- fully release it first.
-            self.preview_player.terminate()
-        self._start_render(proxy, out_path)
+        # A fresh file per build: the preview player can keep the previous
+        # proxy open (and keep playing it) while the new one renders, and
+        # nothing ever has to overwrite a file mpv still holds open.
+        self._start_render(proxy, self._tmp_dir / f"proxy_{uuid.uuid4().hex[:12]}.mp4")
 
     def _start_render(self, proxy: bool, out_path: Path):
         project = self._get_project()
-        clips_snapshot = list(project.clips)
-        canvas_w, canvas_h = project.canvas_w, project.canvas_h
-        proxy_height = int(self._proxy_height_combo.currentText())
+        # project_to_dict is a full deep copy: edits made while the render is
+        # running can't leak into it half-applied.
+        params = {
+            "project": project_to_dict(project),
+            "output": str(out_path),
+            "proxy": proxy,
+            "proxy_height": int(self._proxy_height_combo.currentText()),
+            "probe_hints": media_info.probe_hints(c.source for c in project.clips if not c.is_image),
+        }
 
         self._progress.setValue(0)
         self._status_lbl.setText("Rendering proxy..." if proxy else "Rendering final video...")
-
-        proc_holder: dict = {}
-        self._render_proc_holder = proc_holder
         self._render_kind = "proxy" if proxy else "final"
         if proxy:
-            self._rendering = True
-            self._build_btn.setText(" Cancel")
-            self._build_btn.setProperty("variant", "danger")
-            self._restyle(self._build_btn)
+            self._set_build_button(building=True)
 
-        def on_progress(frac, _label):
-            run_on_ui(lambda: self._progress.setValue(int(frac * 100)))
+        job = WorkerJob("render_timeline", params, parent=self)
+        self._job = job
+        job.progress.connect(lambda frac, msg: self._on_render_progress(job, frac, msg))
+        job.finished.connect(lambda result: self._on_render_done(job, proxy, out_path, result))
+        job.start()
 
-        text_overlays_snapshot = list(project.text_overlays)
-        sound_clips_snapshot = list(project.sound_clips)
+    def _on_render_progress(self, job: WorkerJob, frac: float, msg: str):
+        if job is self._job:
+            self._progress.setValue(int(frac * 100))
+            if msg:
+                self._status_lbl.setText(msg)
 
-        def run():
-            err = None
-            try:
-                ok = ffmpeg_ops.render_timeline(clips_snapshot, canvas_w, canvas_h, out_path,
-                                                 proxy=proxy, proxy_height=proxy_height,
-                                                 progress_cb=on_progress, proc_holder=proc_holder,
-                                                 text_overlays=text_overlays_snapshot,
-                                                 sound_clips=sound_clips_snapshot,
-                                                 intro_type=project.intro_transition_type,
-                                                 intro_duration=project.intro_transition_duration,
-                                                 intro_direction=project.intro_transition_direction,
-                                                 outro_type=project.outro_transition_type,
-                                                 outro_duration=project.outro_transition_duration,
-                                                 outro_direction=project.outro_transition_direction)
-            except Exception as e:  # noqa: BLE001
-                log.exception("Program viewer: render crashed before/during ffmpeg")
-                ok, err = False, e
-
-            def done():
-                # A cancel-then-rebuild (or a second render kind starting
-                # before this thread noticed) replaces _render_proc_holder
-                # with a fresh dict for the new render -- if that happened,
-                # this completion belongs to a superseded render and must not
-                # touch UI state the new one already owns.
-                if proc_holder is not self._render_proc_holder:
-                    return
-                if proxy:
-                    self._rendering = False
-                    self._build_btn.setText(" Build Preview")
-                    self._build_btn.setProperty("variant", "violet")
-                    self._restyle(self._build_btn)
-                self._render_kind = None
-                if err is not None:
-                    self._status_lbl.setText(f"Render error: {err}")
-                elif ok:
-                    label = "(proxy)" if proxy else "(final)"
-                    self._status_lbl.setText("Preview updated." if proxy else f"Saved: {out_path.name}")
-                    self._composed_lbl.setText(f"{out_path.name} {label}")
-                    self.has_composed_preview = True
-                    self._scrubber.set_locked(False)
-                    self.preview_player.load(out_path)
-                    self.composed_recomposed.emit()
-                elif not proc_holder.get("cancelled"):
-                    self._status_lbl.setText("Render failed (see console).")
-            run_on_ui(done)
-
-        threading.Thread(target=run, daemon=True).start()
+    def _on_render_done(self, job: WorkerJob, proxy: bool, out_path: Path, result: dict):
+        if result.get("cancelled") or not result.get("ok"):
+            # Never leave a truncated output file behind.
+            out_path.unlink(missing_ok=True)
+        # A cancel-then-rebuild replaces self._job; a superseded render's
+        # completion must not touch UI state the new one owns.
+        if job is not self._job:
+            return
+        self._job = None
+        if proxy:
+            self._set_build_button(building=False)
+        self._render_kind = None
+        if result.get("cancelled"):
+            return
+        if not result.get("ok"):
+            err = result.get("error")
+            self._status_lbl.setText(f"Render error: {err}" if err else "Render failed (see log).")
+            return
+        self._progress.setValue(100)
+        label = "(proxy)" if proxy else "(final)"
+        self._status_lbl.setText("Preview updated." if proxy else f"Saved: {out_path.name}")
+        self._composed_lbl.setText(f"{out_path.name} {label}")
+        self.has_composed_preview = True
+        self._scrubber.set_locked(False)
+        previous_proxy = self._proxy_path
+        self.preview_player.load(out_path)
+        if proxy:
+            self._proxy_path = out_path
+            if previous_proxy is not None and previous_proxy != out_path:
+                try:
+                    previous_proxy.unlink(missing_ok=True)
+                except OSError:
+                    # Still open (e.g. an editor bake is reading it) -- the
+                    # startup temp sweep removes it next launch.
+                    log.info("Program viewer: old proxy %s still in use, left for startup sweep",
+                             previous_proxy.name)
+        self.composed_recomposed.emit()
 
     def reset_for_new_project(self):
         self.has_composed_preview = False

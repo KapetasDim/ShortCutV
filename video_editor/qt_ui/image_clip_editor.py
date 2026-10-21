@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
 import tempfile
-import threading
 import uuid
 from pathlib import Path
 from typing import Callable, Optional
@@ -12,7 +12,7 @@ from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
                                 QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
 
-from .. import ffmpeg_ops, image_render
+from .. import image_render
 from ..curves import CURVE_PRESETS, eval_curve
 from ..logging_config import get_logger
 from ..project import TimelineClip
@@ -20,8 +20,9 @@ from .icons import icon
 from .inspector_split import make_preview_splitter
 from .player import SharedPlayer
 from .theme import COLORS
-from .util import connect_button, run_on_ui
+from .util import connect_button
 from .widgets import Scrubber, pil_to_qpixmap
+from .worker_client import WorkerJob
 
 log = get_logger()
 
@@ -46,6 +47,7 @@ class ImageClipEditor(QWidget):
         self._baked = False
         self.player: Optional[SharedPlayer] = None
         self._last_bake_path: Optional[Path] = None
+        self._bake_job: Optional[WorkerJob] = None
         self._tmp_dir = Path(tempfile.gettempdir()) / "video_editor_image_preview"
         self._tmp_dir.mkdir(exist_ok=True)
         self._param_edits: dict[str, QLineEdit] = {}
@@ -318,20 +320,25 @@ class ImageClipEditor(QWidget):
         self._bake_progress.setValue(0)
         self._bake_status_lbl.setText("Rendering...")
 
-        def on_progress(frac, _label):
-            run_on_ui(lambda: self._bake_progress.setValue(int(frac * 100)))
+        if self._bake_job is not None:
+            self._bake_job.cancel()
+        job = WorkerJob("bake_image", {"clip": dataclasses.asdict(tmp_clip), "canvas_w": self.canvas_w,
+                                       "canvas_h": self.canvas_h, "output": str(out_path),
+                                       "preview_height": preview_height}, parent=self)
+        self._bake_job = job
+        job.progress.connect(lambda frac, _msg: self._bake_progress.setValue(int(frac * 100)))
+        job.finished.connect(lambda result: self._on_bake_finished(job, out_path, result))
+        job.start()
 
-        def run():
-            try:
-                ok = ffmpeg_ops.render_image_clip_preview(
-                    tmp_clip, self.canvas_w, self.canvas_h, out_path,
-                    preview_height=preview_height, progress_cb=on_progress)
-            except Exception:
-                log.exception("Image clip editor: bake failed for %s", self.clip.path)
-                ok = False
-            run_on_ui(lambda: self._on_bake_done(ok, out_path))
-
-        threading.Thread(target=run, daemon=True).start()
+    def _on_bake_finished(self, job: WorkerJob, out_path: Path, result: dict):
+        if job is not self._bake_job:
+            self._delete_bake_file(out_path)
+            return
+        self._bake_job = None
+        if result.get("cancelled"):
+            self._delete_bake_file(out_path)
+            return
+        self._on_bake_done(bool(result.get("ok")), out_path)
 
     def _on_bake_done(self, ok: bool, out_path: Path):
         self._bake_btn.setEnabled(True)
@@ -407,6 +414,9 @@ class ImageClipEditor(QWidget):
         self.on_close()
 
     def teardown(self):
+        if self._bake_job is not None:
+            self._bake_job.cancel()
+            self._bake_job = None
         if self.player is not None:
             self.player.terminate()
         if self._last_bake_path is not None:

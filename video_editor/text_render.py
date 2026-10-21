@@ -6,13 +6,13 @@ bundled, which is preferred when available -- see fonts_catalog.py).
 from __future__ import annotations
 
 import dataclasses
+import functools
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PIL import Image, ImageDraw, ImageFont
 
 from . import fonts_catalog
-from .curves import eval_curve, fade_opacity
 from .logging_config import get_logger
 
 if TYPE_CHECKING:
@@ -46,6 +46,23 @@ def _wrap_text(draw: "ImageDraw.ImageDraw", text: str, font: "ImageFont.FreeType
     return "\n".join(out_lines)
 
 
+@functools.lru_cache(maxsize=64)
+def _load_font(path: str, size: int) -> "ImageFont.FreeTypeFont":
+    # Parsing a .ttf is the single most expensive step of rendering a frame;
+    # an animated overlay asks for the same (font, size) pairs over and over.
+    return ImageFont.truetype(path, size)
+
+
+def font_identity(overlay: "TextOverlay") -> tuple[str, int]:
+    """(font file, mtime) -- part of the render-cache key, so swapping a
+    font file on disk invalidates text baked with the old one."""
+    path = fonts_catalog.font_path(overlay.font_family, overlay.bold)
+    try:
+        return (str(path), Path(path).stat().st_mtime_ns)
+    except OSError:
+        return (str(path), 0)
+
+
 def render_text_frame(overlay: "TextOverlay", scale: float) -> Image.Image:
     """Returns a tightly-cropped RGBA image of the styled/rotated text at the
     given scale multiplier (content only, not the full canvas)."""
@@ -53,7 +70,7 @@ def render_text_frame(overlay: "TextOverlay", scale: float) -> Image.Image:
     size = max(1, round(overlay.font_size * scale))
     path = fonts_catalog.font_path(overlay.font_family, overlay.bold)
     try:
-        font = ImageFont.truetype(str(path), size)
+        font = _load_font(str(path), size)
     except OSError:
         log.exception("could not load font '%s' at %s (missing/corrupt font file)", overlay.font_family, path)
         raise
@@ -155,28 +172,3 @@ def scale_overlay(overlay: "TextOverlay", factor: float) -> "TextOverlay":
         font_size=max(1, round(overlay.font_size * factor)),
         outline_width=max(1, round(overlay.outline_width * factor)) if overlay.outline_enabled else overlay.outline_width,
     )
-
-
-def render_overlay_sequence(overlay: "TextOverlay", canvas_w: int, canvas_h: int,
-                             fps: int, out_dir: Path) -> tuple[Path, int]:
-    """Bakes the overlay's scale curve into a numbered PNG sequence, each frame
-    the full size of the render canvas (transparent background), so ffmpeg can
-    just overlay it at x=0,y=0 with no per-frame offset math."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    n_frames = max(1, round(overlay.duration_s * fps))
-
-    for i in range(n_frames):
-        t_norm = i / (n_frames - 1) if n_frames > 1 else 0.0
-        t_s = t_norm * overlay.duration_s
-        scale = eval_curve(overlay.curve_preset, overlay.curve_params, t_norm)
-        opacity = fade_opacity(t_s, overlay.duration_s, overlay.fade_in_s, overlay.fade_out_s)
-        content = apply_opacity(render_text_frame(overlay, scale), opacity)
-        frame = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
-        px = round(overlay.x - content.width / 2)
-        py = round(overlay.y - content.height / 2)
-        frame.alpha_composite(content, (px, py))
-        frame.save(out_dir / f"seq_{i:05d}.png")
-
-    log.info("Text overlay: rendered %d frames for '%s'", n_frames,
-              (overlay.text or "")[:30])
-    return out_dir, n_frames

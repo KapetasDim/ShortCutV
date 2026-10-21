@@ -3,36 +3,35 @@ from __future__ import annotations
 import copy
 import json
 import tempfile
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image
 from PySide6.QtCore import QEvent, QSettings, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import QDockWidget, QMainWindow, QMessageBox, QPlainTextEdit, QTabWidget
 
-from .. import active_processes
 from ..logging_config import get_logger
-from ..project import SoundClip, TextOverlay, TimelineClip, TimelineProject, load_project, save_project
+from ..project import (SoundClip, TextOverlay, TimelineClip, TimelineProject, load_project, save_project,
+                       write_text_atomic)
+from . import media_info, worker_client
 from .bin_panel import BinPanel
 from .clip_trim_editor import ClipTrimEditor
 from .dialogs import ask_open_filename, ask_save_filename
 from .image_clip_editor import ImageClipEditor
 from .inspector import InspectorPanel
-from .job_queue import get_queue
+from .job_queue import HIGH, get_queue
 from .log_bridge import attach_text_widget
-from .metadata_worker import request_metadata
 from .player import SharedPlayer
 from .program_viewer import ProgramViewerPanel
 from .scale import get_scale
 from .sound_clip_editor import SoundClipEditor
 from .source_viewer import BatchCropResizeDialog, SourceViewerPanel
 from .text_overlay_editor import TextOverlayEditor
-from .thumbnail_worker import request_thumbnail
 from .timeline_widget import TimelineWidget
 from .undo import ProjectUndoStack
-from .util import connect_button, init_ui_marshalling
+from .util import connect_button
 
 log = get_logger()
 
@@ -96,7 +95,7 @@ class AppState:
     def save(self):
         try:
             raw = {k: (str(v) if v else None) for k, v in asdict(self).items()}
-            STATE_FILE.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+            write_text_atomic(STATE_FILE, json.dumps(raw, indent=2))
         except OSError:
             log.exception("Failed to save app state to %s", STATE_FILE)
 
@@ -104,11 +103,6 @@ class AppState:
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
-        # Establish GUI-thread ownership of the run_on_ui marshaller before
-        # anything can spawn a worker thread that calls it (render/ffmpeg
-        # callbacks) -- otherwise queued UI callbacks, including mpv loads,
-        # can end up executing on a worker thread and crash libmpv.
-        init_ui_marshalling()
         self.setWindowTitle("ShortCutV")
         w, h = get_scale().app_window_geometry.split("x")
         self.resize(int(w), int(h))
@@ -118,8 +112,11 @@ class App(QMainWindow):
         self.player = SharedPlayer(self)                    # Bin/Source viewer preview
         self.preview_player = SharedPlayer(self, window_x_offset=480)  # Program (composed) viewer preview
         self.undo = ProjectUndoStack(apply=self._apply_project_snapshot)
+        self.undo.reset(self.project)
+        self._pending_adds: deque[dict] = deque()
         self.settings = QSettings("ShortCutV", "ShortCutV")
         _sweep_temp_dirs()
+        worker_client.sweep_stale_job_files()
         self._tmp_dir = Path(tempfile.gettempdir()) / "video_editor_proxy"
         self._tmp_dir.mkdir(exist_ok=True)
 
@@ -148,6 +145,8 @@ class App(QMainWindow):
         # position was saved from a previous run, undoing the setTabPosition
         # call in _build_docks -- so pin it again here, after restore.
         self.setTabPosition(Qt.DockWidgetArea.AllDockWidgetAreas, QTabWidget.TabPosition.North)
+        # Keep the render cache (baked frames + proxy segments) under its cap.
+        worker_client.WorkerJob("prune_cache", {}, parent=self).start()
         log.info("App started")
 
     # -------------------------------------------------------------- panels --
@@ -381,34 +380,40 @@ class App(QMainWindow):
     # ---------------------------------------------------------- timeline ops --
 
     def _add_clip(self, path: Path, kind: str, in_s: Optional[float], out_s: Optional[float]):
-        if kind == "image":
-            try:
-                with Image.open(path) as img:
-                    width, height = img.size
-            except Exception:
-                log.exception("Workspace: failed to add %s to timeline (unreadable/corrupt source?)", path)
-                self.program_viewer._status_lbl.setText(f"Could not add {path.name} (see log).")
-                return
-            clip = TimelineClip(source=str(path), in_s=0.0, out_s=DEFAULT_IMAGE_DURATION, is_image=True)
-            self._finish_add_clip(path, clip, width, height)
-            return
+        # Probes finish in any order (and images resolve instantly), so each
+        # request takes a slot in _pending_adds and clips land on the
+        # timeline in the order they were requested, not the order their
+        # probes happened to finish.
+        slot = {"ready": False, "clip": None}
+        self._pending_adds.append(slot)
 
-        # ffprobe runs off the job queue instead of blocking this (GUI)
-        # thread -- a slow/corrupt file or a network drive used to freeze the
-        # whole app for up to 20s on every add.
-        def on_probe(_key, duration_s, width, height):
-            if duration_s <= 0 and not width and not height:
+        # Probed off the GUI thread through the shared cache (usually already
+        # filled by the Bin) at HIGH priority, so it doesn't queue behind a
+        # Bin refresh's backlog.
+        def on_probe(info: media_info.MediaInfo):
+            if not info.ok:
                 log.error("Workspace: failed to add %s to timeline (unreadable/corrupt source?)", path)
                 self.program_viewer._status_lbl.setText(f"Could not add {path.name} (see log).")
-                return
-            clip = TimelineClip(source=str(path), in_s=in_s or 0.0, out_s=out_s or duration_s)
-            self._finish_add_clip(path, clip, width, height)
+            elif kind == "image":
+                slot["clip"] = (TimelineClip(source=str(path), in_s=0.0, out_s=DEFAULT_IMAGE_DURATION,
+                                             is_image=True), info.width, info.height)
+            else:
+                slot["clip"] = (TimelineClip(source=str(path), in_s=in_s or 0.0, out_s=out_s or info.duration_s),
+                                info.width, info.height)
+            slot["ready"] = True
+            self._flush_pending_adds()
 
-        request_metadata(path, path, "video", on_probe)
+        media_info.request(path, on_probe, kind=kind, priority=HIGH)
+
+    def _flush_pending_adds(self):
+        while self._pending_adds and self._pending_adds[0]["ready"]:
+            slot = self._pending_adds.popleft()
+            if slot["clip"] is not None:
+                clip, width, height = slot["clip"]
+                self._finish_add_clip(clip.path, clip, width, height)
 
     def _finish_add_clip(self, path: Path, clip: TimelineClip, width: int, height: int):
         is_first_clip = not self.project.clips
-        self.undo.begin(self.project)
         self.project.clips.append(clip)
         if is_first_clip and width and height:
             width, height = width // 2 * 2, height // 2 * 2
@@ -416,49 +421,44 @@ class App(QMainWindow):
             log.info("Workspace: output canvas defaulted to %dx%d (first clip's resolution)", width, height)
         self.undo.commit(f"Add {path.name}", self.project)
         self._refresh_timeline_widget()
-        self._request_thumbnail(len(self.project.clips) - 1)
         log.info("Workspace: added %s", path.name)
 
     def _add_sound(self, path: Path):
         # See _add_clip: probing off the job queue instead of blocking the
         # GUI thread.
-        def on_probe(_key, duration_s, _width, _height):
-            duration_s = max(0.05, duration_s) if duration_s > 0 else 5.0
-            self.undo.begin(self.project)
+        def on_probe(info: media_info.MediaInfo):
+            duration_s = max(0.05, info.duration_s) if info.duration_s > 0 else 5.0
             start_s = self.preview_player.current_pos_s() if self.program_viewer.has_composed_preview else 0.0
             self.project.sound_clips.append(SoundClip(source=str(path), start_s=start_s, clip_duration_s=duration_s))
             self.undo.commit(f"Add sound {path.name}", self.project)
             self._refresh_timeline_widget()
             log.info("Workspace: added sound %s @ %.2fs", path.name, start_s)
 
-        request_metadata(path, path, "sound", on_probe)
+        media_info.request(path, on_probe, kind="sound", priority=HIGH)
 
     def _on_reorder(self, from_idx: int, to_idx: int):
-        self.undo.begin(self.project)
+        self._clear_selection()
         clip = self.project.clips.pop(from_idx)
         self.project.clips.insert(to_idx, clip)
         self.undo.commit("Reorder clip", self.project)
-        # A reorder doesn't change any clip's content, so its thumbnail is
-        # still valid -- just permute the cached thumbnails to follow the move
-        # instead of re-running ffmpeg for every clip on the timeline.
-        self.timeline_widget.move_thumbnail(from_idx, to_idx)
-        self.timeline_widget.set_project_data(
-            self.project.clips, self.project.text_overlays, self.project.sound_clips,
-            preserve_thumbs=True)
+        self._refresh_timeline_widget()
 
     def _on_remove_clip(self, index: int):
         if not (0 <= index < len(self.project.clips)):
             return
-        self.undo.begin(self.project)
+        # Editors are bound to an index; any open one may now point at the
+        # wrong item.
+        self._clear_selection()
         removed = self.project.clips.pop(index)
         self.undo.commit(f"Remove {Path(removed.source).name}", self.project)
         self._refresh_timeline_widget()
-        for i in range(index, len(self.project.clips)):
-            self._request_thumbnail(i)
         log.info("Workspace: removed %s from timeline", Path(removed.source).name)
 
+    def _clear_selection(self):
+        self.inspector.clear()
+        self.timeline_widget.selected = None
+
     def _on_transition_change(self, clip: TimelineClip, transition_type, duration, direction="left"):
-        self.undo.begin(self.project)
         clip.transition_type = transition_type
         clip.transition_duration = duration
         clip.transition_direction = direction
@@ -472,10 +472,21 @@ class App(QMainWindow):
     def _on_sound_moved(self, index: int):
         self.undo.commit("Move sound", self.project)
         self._refresh_timeline_widget()
+        self._sync_open_editor_start("sound", index, SoundClipEditor, self.project.sound_clips)
 
     def _on_text_moved(self, index: int):
         self.undo.commit("Move text overlay", self.project)
         self._refresh_timeline_widget()
+        self._sync_open_editor_start("text", index, TextOverlayEditor, self.project.text_overlays)
+
+    def _sync_open_editor_start(self, kind: str, index: int, editor_cls, items):
+        """The item was just dragged on the timeline. If its editor is open,
+        push the new start into it -- otherwise the editor's stale start
+        field would silently undo the drag on its next Update."""
+        editor = self.inspector._current_editor
+        if (isinstance(editor, editor_cls) and self.timeline_widget.selected == (kind, index)
+                and 0 <= index < len(items)):
+            editor.set_start(items[index].start_s)
 
     def _on_drop_bin_item(self, raw: str):
         path_str, kind = raw.rsplit("|", 1)
@@ -493,18 +504,16 @@ class App(QMainWindow):
         if kind == "clip":
             self._on_remove_clip(index)
         elif kind == "text":
-            self.undo.begin(self.project)
+            self._clear_selection()
             if 0 <= index < len(self.project.text_overlays):
                 self.project.text_overlays.pop(index)
             self.undo.commit("Remove text overlay", self.project)
-            self.timeline_widget.selected = None
             self._refresh_timeline_widget()
         elif kind == "sound":
-            self.undo.begin(self.project)
+            self._clear_selection()
             if 0 <= index < len(self.project.sound_clips):
                 self.project.sound_clips.pop(index)
             self.undo.commit("Remove sound", self.project)
-            self.timeline_widget.selected = None
             self._refresh_timeline_widget()
 
     def _duplicate_selected(self):
@@ -516,7 +525,7 @@ class App(QMainWindow):
             return
         if not (0 <= index < len(self.project.text_overlays)):
             return
-        self.undo.begin(self.project)
+        self._clear_selection()
         duplicate = copy.deepcopy(self.project.text_overlays[index])
         self.project.text_overlays.insert(index + 1, duplicate)
         self.undo.commit("Duplicate text overlay", self.project)
@@ -548,7 +557,6 @@ class App(QMainWindow):
             if not (0 <= index < len(self.project.clips)):
                 return
             clip = self.project.clips[index]
-            self.undo.begin(self.project)
             if clip.is_image:
                 editor = ImageClipEditor(
                     self.inspector, clip, self.project.canvas_w, self.project.canvas_h,
@@ -563,7 +571,6 @@ class App(QMainWindow):
             if not (0 <= index < len(self.project.text_overlays)):
                 return
             overlay = self.project.text_overlays[index]
-            self.undo.begin(self.project)
             editor = TextOverlayEditor(
                 self.inspector, self.project, self.preview_player,
                 on_save=lambda o: self._on_inspector_text_saved(index, o),
@@ -573,7 +580,6 @@ class App(QMainWindow):
             if not (0 <= index < len(self.project.sound_clips)):
                 return
             sound = self.project.sound_clips[index]
-            self.undo.begin(self.project)
             editor = SoundClipEditor(
                 self.inspector, self.project, self.preview_player, sound.source,
                 on_save=lambda s: self._on_inspector_sound_saved(index, s),
@@ -588,7 +594,6 @@ class App(QMainWindow):
     def _on_inspector_clip_changed(self, index: int):
         self.undo.commit("Edit clip", self.project)
         self._refresh_timeline_widget()
-        self._request_thumbnail(index)
 
     def _on_inspector_text_saved(self, index: int, overlay: TextOverlay):
         if 0 <= index < len(self.project.text_overlays):
@@ -613,13 +618,6 @@ class App(QMainWindow):
         self.timeline_widget.set_project_data(
             self.project.clips, self.project.text_overlays, self.project.sound_clips)
 
-    def _request_thumbnail(self, index: int):
-        if index >= len(self.project.clips):
-            return
-        clip = self.project.clips[index]
-        request_thumbnail(index, clip,
-                           lambda i, data: self.timeline_widget.set_thumbnail(i, data, clip))
-
     # ---------------------------------------------------------- undo/redo --
 
     def _apply_project_snapshot(self, project: TimelineProject):
@@ -627,14 +625,13 @@ class App(QMainWindow):
         self.inspector.clear()
         self.timeline_widget.selected = None
         self._refresh_timeline_widget()
-        for i in range(len(self.project.clips)):
-            self._request_thumbnail(i)
 
     # ------------------------------------------------------------- projects --
 
     def _new_project(self):
         self.project = TimelineProject()
-        self.undo.qt_stack.clear()
+        self.undo.reset(self.project)
+        self._pending_adds.clear()  # probes still in flight belong to the old project
         self.inspector.clear()
         self.program_viewer.reset_for_new_project()
         self.timeline_widget.reset_waveform_state()
@@ -677,7 +674,8 @@ class App(QMainWindow):
                 self.program_viewer._status_lbl.setText("Load failed (see console).")
                 return
             self.project = loaded
-            self.undo.qt_stack.clear()
+            self.undo.reset(self.project)
+            self._pending_adds.clear()
             self.inspector.clear()
             if loaded.lib_input_dir or loaded.lib_output_dir:
                 self.bin_panel.set_folders(
@@ -686,8 +684,6 @@ class App(QMainWindow):
             self.program_viewer.reset_for_new_project()
             self.timeline_widget.reset_waveform_state()
             self._refresh_timeline_widget()
-            for i in range(len(self.project.clips)):
-                self._request_thumbnail(i)
             self.program_viewer._status_lbl.setText(f"Project loaded: {path.name}")
 
         ask_open_filename(self, on_path, title="Load project...", filetypes=[("Project JSON", "*.json")])
@@ -751,18 +747,13 @@ class App(QMainWindow):
         log.info("App closing")
         # Nothing else stops these on its own: an open Inspector editor still
         # owns its own mpv player + bake temp file (teardown only runs when
-        # the editor is closed/replaced, never on app close), a live render's
-        # ffmpeg child is a daemon-thread-owned subprocess that outlives the
-        # thread if not told to stop, and Qt destroys still-running
+        # the editor is closed/replaced, never on app close), worker
+        # processes (renders, bakes, exports, batch crop) would otherwise run
+        # on until they notice the GUI is gone, and Qt destroys still-running
         # QProcess job-queue entries out from under themselves otherwise.
-        if self.program_viewer._render_kind is not None:
-            self.program_viewer._cancel_render()
         self.inspector.clear()
         get_queue().shutdown()
-        # Exports and batch crop/resize run in daemon threads with no
-        # per-widget handle the way renders have -- this is the only place
-        # left that can still reach and kill them.
-        active_processes.kill_all()
+        worker_client.cancel_all()
         self.player.terminate()
         self.preview_player.terminate()
         self.state_data.clip_input_dir = self.bin_panel.input_dir

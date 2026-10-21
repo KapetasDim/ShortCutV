@@ -11,8 +11,5 @@ source my_venv/bin/activate
 
 pip install -r requirements.txt
 
-
-#older - works
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-# newer
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+# ffmpeg and ffprobe must be on PATH (e.g. the gyan.dev full build).
+# libmpv-2.dll is unpacked from libmpv-2.dll.xz on first launch.

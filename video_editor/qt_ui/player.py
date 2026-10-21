@@ -6,6 +6,7 @@ window snapped beside the main app if no embed widget is set.
 """
 from __future__ import annotations
 
+import os
 import weakref
 from pathlib import Path
 from typing import Callable, Optional
@@ -77,6 +78,7 @@ class SharedPlayer:
         self._window_width = window_width
         self._window_x_offset = window_x_offset
         self._player: Optional[mpv.MPV] = None
+        self._player_wid: Optional[str] = None  # embed target the live instance was created for
         self._duration_s = 0.0
         self._tick_cb: TickCB = None
         self._current_path: Optional[Path] = None
@@ -124,27 +126,36 @@ class SharedPlayer:
         self._tick_cb = fn
 
     def load(self, path: Path, on_ready: Optional[Callable[[], None]] = None, is_image: bool = False):
+        """Reuses this player's mpv instance (a `loadfile` into the running
+        player) instead of tearing it down and starting a new one per file --
+        creating an mpv instance costs hundreds of ms plus a fresh set of
+        threads and a new native child window. A new instance is only made
+        when the embed target changed, or after terminate()."""
         self._stop_polling()
-        if self._player is not None:
-            self._player.terminate()
-            self._player = None
         self._generation += 1
         generation = self._generation
+        wid = str(int(self._embed_widget.winId())) if self._embed_widget is not None else None
+        if self._player is not None and wid != self._player_wid:
+            self._player.terminate()
+            self._player = None
 
         log.info("Player: loading %s", path.name)
         self._current_path = path
         self._is_image = is_image
         self._duration_s = 0.0
         try:
-            if self._embed_widget is not None:
-                wid = str(int(self._embed_widget.winId()))
-                self._player = mpv.MPV(wid=wid, keep_open=True, pause=True)
+            if self._player is None:
+                if wid is not None:
+                    self._player = mpv.MPV(wid=wid, keep_open=True, pause=True)
+                else:
+                    self._player = mpv.MPV(keep_open=True, pause=True, geometry=self._snap_geometry())
+                self._player_wid = wid
             else:
-                self._player = mpv.MPV(keep_open=True, pause=True, geometry=self._snap_geometry())
+                self._player.pause = True
             self._player.play(str(path))
         except Exception:
             log.exception("Player: failed to load %s", path)
-            self._player = None
+            self.terminate()
             return
 
         if is_image:
@@ -165,9 +176,14 @@ class SharedPlayer:
             return
         try:
             d = self._player.duration
+            # loadfile is asynchronous: until mpv actually switches files, a
+            # reused instance still reports the PREVIOUS file's duration.
+            loaded = self._player.path
+            switched = loaded is not None and os.path.normcase(str(loaded)) == os.path.normcase(
+                str(self._current_path))
         except Exception:
-            d = None
-        if d is None or d <= 0:
+            d, switched = None, False
+        if d is None or d <= 0 or not switched:
             QTimer.singleShot(100, lambda: self._wait_for_duration(on_ready, generation, attempt + 1))
             return
         self._duration_s = d
@@ -249,3 +265,4 @@ class SharedPlayer:
         if self._player is not None:
             self._player.terminate()
             self._player = None
+        self._player_wid = None

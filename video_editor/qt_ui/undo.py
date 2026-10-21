@@ -1,13 +1,20 @@
 """Project-wide undo/redo, backed by Qt's own QUndoStack.
 
 TimelineProject is a small tree of plain dataclasses (no video bytes, just
-paths/floats/strings), so rather than writing a bespoke QUndoCommand for each
-of the dozen or so edit operations (reorder clip, trim, crop, add/remove
-overlay, add/remove sound, transition change, ...), this uses one generic
-snapshot command: callers grab a deep copy of the project before mutating it,
-mutate it, then push (before, after) here. Undo/redo just swaps the whole
-project object back in and asks the workspace to refresh -- correct by
-construction, and cheap enough given the data sizes involved.
+paths/floats/strings), so rather than a bespoke QUndoCommand per edit
+operation, this uses one generic snapshot command.
+
+Commit-only model: the stack remembers the last committed state itself.
+Every mutation path just mutates the live project and then calls
+commit(label, project); the command is (last committed -> now). There is no
+begin()/commit() pairing to get out of sync -- the old pairing kept one
+pending snapshot that the first commit consumed, so a second edit in the same
+editor session (or an editor save after a timeline drag) silently never
+reached the stack.
+
+Snapshots handed to `apply` on undo/redo are always fresh copies: the live
+project gets mutated in place afterwards, and that must never write through
+into a snapshot still sitting on the stack.
 """
 from __future__ import annotations
 
@@ -21,17 +28,24 @@ from ..project import TimelineProject
 
 class _SnapshotCommand(QUndoCommand):
     def __init__(self, label: str, before: TimelineProject, after: TimelineProject,
-                 apply: Callable[[TimelineProject], None]):
+                 owner: "ProjectUndoStack"):
         super().__init__(label)
         self._before = before
         self._after = after
-        self._apply = apply
+        self._owner = owner
+        self._first_redo = True
 
     def undo(self):
-        self._apply(self._before)
+        self._owner._restore(self._before)
 
     def redo(self):
-        self._apply(self._after)
+        # QUndoStack.push() calls redo() immediately; the live project
+        # already IS the after-state then, so don't swap it out from under
+        # whatever editor just made the change.
+        if self._first_redo:
+            self._first_redo = False
+            return
+        self._owner._restore(self._after)
 
 
 class ProjectUndoStack:
@@ -40,28 +54,30 @@ class ProjectUndoStack:
         refreshes every panel bound to it -- provided by the owning window."""
         self._stack = QUndoStack()
         self._apply = apply
-        self._before_snapshot: TimelineProject | None = None
+        self._baseline: TimelineProject = TimelineProject()
 
     @property
     def qt_stack(self) -> QUndoStack:
         return self._stack
 
-    def begin(self, project: TimelineProject):
-        """Call before mutating `project` in place."""
-        self._before_snapshot = copy.deepcopy(project)
+    def reset(self, project: TimelineProject):
+        """New/loaded project: clears history and takes `project` as the
+        baseline the next commit is compared against."""
+        self._stack.clear()
+        self._baseline = copy.deepcopy(project)
 
     def commit(self, label: str, project: TimelineProject):
-        """Call right after mutating `project` in place; pushes the edit onto
-        the undo stack. No-op if begin() was never called (or the project
-        didn't actually change, judged by equality of the JSON-able fields)."""
-        if self._before_snapshot is None:
-            return
-        before = self._before_snapshot
-        self._before_snapshot = None
+        """Call right after mutating `project`. No-op if nothing changed."""
         after = copy.deepcopy(project)
-        if before == after:
+        if after == self._baseline:
             return
-        self._stack.push(_SnapshotCommand(label, before, after, self._apply))
+        before = self._baseline
+        self._baseline = after
+        self._stack.push(_SnapshotCommand(label, before, copy.deepcopy(after), self))
+
+    def _restore(self, snapshot: TimelineProject):
+        self._baseline = copy.deepcopy(snapshot)
+        self._apply(copy.deepcopy(snapshot))
 
     def undo(self):
         self._stack.undo()

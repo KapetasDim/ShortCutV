@@ -1,20 +1,20 @@
-"""Audio waveform extraction for the timeline's audio lane.
+"""Audio waveform peaks for the timeline's audio lane.
 
-Decodes a low sample-rate mono PCM stream via ffmpeg (cheap: ~8kb/s of source
-audio) and reduces it to (min, max) peak pairs bucketed to however many columns
-the caller wants to draw.
+Each source file is decoded ONCE (low-rate mono PCM via ffmpeg, through the
+shared job_queue) into a fixed-resolution min/max envelope covering the whole
+file. A sound clip's trim window (clip_start_s / clip_duration_s) is then
+just a slice of that envelope -- trimming a clip, or placing the same file
+twice with different offsets, never re-decodes.
 
-The ffmpeg decode is dispatched through the shared job_queue (a QProcess pool
-on the GUI event loop), NOT a Python thread -- the old threading.Thread +
-subprocess path here was the one remaining copy of the pattern that
-reproducibly crashed the process near libmpv (see thumbnail_worker.py). This
-module now only builds the command and reduces the raw PCM bytes it returns;
-the timeline submits the command and feeds the bytes back in.
+The PCM -> envelope reduction runs on the GUI thread, so it avoids per-sample
+Python loops: strided memoryview slices fed to map(max/min, ...) keep the
+iteration in C (a 10-minute track reduces in well under 100 ms).
 """
 from __future__ import annotations
 
-import struct
+from array import array
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -22,86 +22,70 @@ from ..logging_config import get_logger
 
 log = get_logger()
 
-_SAMPLE_RATE = 4000  # Hz -- plenty for a min/max peak overview, keeps decode/memory small
+SAMPLE_RATE = 4000      # Hz decoded -- plenty for an overview, ~8 KB per second of audio
+PEAKS_PER_S = 200       # envelope resolution; the draw step downsamples to on-screen width
+_SAMPLES_PER_PEAK = SAMPLE_RATE // PEAKS_PER_S
 
-# Keyed by (path, mtime_ns, start_s, duration_s) -> the reduced peaks, oldest
-# access first. Reused across redraws so a sound clip's waveform is only
-# decoded once. mtime is part of the key so a re-exported/edited file gets a
-# fresh decode instead of showing its old waveform forever; the OrderedDict
-# + _CACHE_MAX cap bounds memory since nothing else evicts entries for files
-# that keep changing across a long session.
-_CACHE_MAX = 300
-_CACHE: "OrderedDict[tuple[str, int, float, float], list[tuple[float, float]]]" = OrderedDict()
+_CACHE_MAX = 100
+FileKey = tuple[str, int, int]
 
 
-def _cache_key(path: Path, start_s: float, duration_s: float | None) -> Optional[tuple[str, int, float, float]]:
+@dataclass
+class FilePeaks:
+    mins: array
+    maxs: array
+
+    def segment(self, start_s: float, duration_s: float) -> list[tuple[float, float]]:
+        a = max(0, int(start_s * PEAKS_PER_S))
+        b = min(len(self.maxs), a + max(1, int(duration_s * PEAKS_PER_S)))
+        return list(zip(self.mins[a:b], self.maxs[a:b]))
+
+
+_CACHE: "OrderedDict[FileKey, FilePeaks]" = OrderedDict()
+
+
+def file_key(path: Path) -> Optional[FileKey]:
     try:
-        mtime_ns = path.stat().st_mtime_ns
+        st = Path(path).stat()
     except OSError:
         return None
-    return (str(path), mtime_ns, start_s, duration_s if duration_s is not None else -1.0)
+    return (str(path), st.st_mtime_ns, st.st_size)
 
 
-def cached_peaks(path: Path, num_buckets: int, start_s: float = 0.0,
-                 duration_s: float | None = None) -> list[tuple[float, float]] | None:
-    """Returns already-computed peaks for this request, or None if not cached
-    (or cached at a different bucket count and thus stale for this draw)."""
-    key = _cache_key(path, start_s, duration_s)
-    if key is None:
-        return None
-    cached = _CACHE.get(key)
-    if cached is not None and len(cached) == num_buckets:
+def cached(key: FileKey) -> Optional[FilePeaks]:
+    peaks = _CACHE.get(key)
+    if peaks is not None:
         _CACHE.move_to_end(key)
-        return cached
-    return None
+    return peaks
 
 
 def clear_cache():
-    """Drops every cached waveform and its pending/done bookkeeping is the
-    caller's job (see timeline_widget.reset_waveform_state) -- call both on
-    New/Load Project so a freshly loaded project starts from a clean slate
-    instead of reusing whatever the previous project happened to touch."""
+    """Drops every cached envelope. The timeline's pending/done bookkeeping is
+    reset separately (timeline_widget.reset_waveform_state)."""
     _CACHE.clear()
 
 
-def ffmpeg_args(path: Path, start_s: float = 0.0,
-                duration_s: float | None = None) -> list[str]:
-    """The ffmpeg arguments (everything after the "ffmpeg" program name) that
-    decode `path`'s audio to raw mono s16le PCM on stdout."""
-    args = ["-v", "quiet", "-ss", str(max(0.0, start_s))]
-    if duration_s is not None:
-        args += ["-t", str(max(0.01, duration_s))]
-    args += ["-i", str(path), "-f", "s16le", "-ac", "1", "-ar", str(_SAMPLE_RATE),
-             "-map", "0:a:0?", "pipe:1"]
-    return args
+def ffmpeg_args(path: Path) -> list[str]:
+    """Arguments (after the "ffmpeg" program name) that decode the whole of
+    `path`'s first audio stream to raw mono s16le PCM on stdout."""
+    return ["-v", "quiet", "-i", str(path), "-map", "0:a:0?", "-f", "s16le", "-ac", "1",
+            "-ar", str(SAMPLE_RATE), "pipe:1"]
 
 
-def reduce_pcm_to_peaks(raw: bytes, num_buckets: int, path: Path,
-                        start_s: float = 0.0, duration_s: float | None = None
-                        ) -> list[tuple[float, float]]:
-    """Reduces raw mono s16le PCM to `num_buckets` (min, max) pairs in [-1, 1]
-    and caches the result. Empty list if there was no audio / no data."""
-    num_buckets = max(1, int(num_buckets))
-    n_samples = len(raw) // 2
-    if n_samples == 0:
-        return []
-    samples = struct.unpack(f"<{n_samples}h", raw[:n_samples * 2])
-
-    per_bucket = max(1, n_samples // num_buckets)
-    peaks: list[tuple[float, float]] = []
-    for i in range(num_buckets):
-        lo = i * per_bucket
-        hi = min(n_samples, lo + per_bucket) if i < num_buckets - 1 else n_samples
-        if lo >= hi:
-            peaks.append((0.0, 0.0))
-            continue
-        chunk = samples[lo:hi]
-        peaks.append((min(chunk) / 32768.0, max(chunk) / 32768.0))
-
-    key = _cache_key(path, start_s, duration_s)
-    if key is not None:
-        _CACHE[key] = peaks
-        _CACHE.move_to_end(key)
-        while len(_CACHE) > _CACHE_MAX:
-            _CACHE.popitem(last=False)
+def reduce_and_store(key: FileKey, raw: bytes) -> FilePeaks:
+    n_peaks = (len(raw) // 2) // _SAMPLES_PER_PEAK
+    if n_peaks == 0:
+        peaks = FilePeaks(array("f"), array("f"))
+    else:
+        samples = memoryview(raw)[: n_peaks * _SAMPLES_PER_PEAK * 2].cast("h")
+        # Column k holds sample k of every bucket; map(max, *columns) then
+        # walks all buckets in lockstep inside C.
+        columns = [samples[k::_SAMPLES_PER_PEAK] for k in range(_SAMPLES_PER_PEAK)]
+        scale = 1.0 / 32768.0
+        peaks = FilePeaks(array("f", (v * scale for v in map(min, *columns))),
+                          array("f", (v * scale for v in map(max, *columns))))
+    _CACHE[key] = peaks
+    _CACHE.move_to_end(key)
+    while len(_CACHE) > _CACHE_MAX:
+        _CACHE.popitem(last=False)
     return peaks

@@ -7,7 +7,6 @@ than a handful of files and the panel is narrow."""
 from __future__ import annotations
 
 import subprocess
-from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
@@ -17,39 +16,20 @@ from PySide6.QtWidgets import (QAbstractItemView, QHBoxLayout, QHeaderView, QLab
                                 QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from ..logging_config import get_logger
-from .crop_resize_tab import IMAGE_EXTS
+from ..media_types import AUDIO_EXTS, IMAGE_EXTS, VIDEO_EXTS
+from . import media_info
 from .dialogs import ask_directory
 from .icons import icon
-from .metadata_worker import request_metadata
+from .job_queue import LOW, cancel_group
 from .theme import COLORS
 from .timeline_widget import BIN_ITEM_MIME
 from .util import connect_button
 
 log = get_logger()
 
-AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg"}
-VIDEO_EXTS = {".mp4"}
 _ICON_BY_KIND = {"video": "scissors", "image": "image", "sound": "sound"}
 COL_NAME, COL_TYPE, COL_DURATION, COL_RESOLUTION, COL_SOURCE = range(5)
-
-# Keyed by (str(path), mtime_ns) -> (duration_s, width, height), oldest
-# access first. refresh() runs on every folder pick, external drop, manual
-# refresh, and twice at startup -- without this, each one re-probes every
-# file with ffprobe even though nothing changed, piling up pointless
-# subprocess launches ahead of whatever probe the user's current action
-# actually needs answered. Capped LRU-style like the probe/waveform caches;
-# a failed probe (0, 0, 0) is deliberately never cached, so a transient
-# failure ("--"/"--" in the Bin columns) gets retried on the next refresh
-# instead of sticking until the file's mtime happens to change.
-_METADATA_CACHE_MAX = 2000
-_METADATA_CACHE: "OrderedDict[tuple[str, int], tuple[float, int, int]]" = OrderedDict()
-
-
-def _metadata_cache_key(path: Path) -> Optional[tuple[str, int]]:
-    try:
-        return (str(path), path.stat().st_mtime_ns)
-    except OSError:
-        return None
+_PROBE_GROUP = "bin"
 
 
 class BinPanel(QWidget):
@@ -164,6 +144,9 @@ class BinPanel(QWidget):
         log.info("Bin: imported %d external file(s)", len(paths))
 
     def refresh(self):
+        # Probes still queued for the previous listing are pointless now.
+        cancel_group(_PROBE_GROUP)
+        media_info.forget_cancelled()
         self._items = []
         for tag, d in (("in", self._input_dir), ("out", self._output_dir)):
             if d and d.exists():
@@ -179,36 +162,19 @@ class BinPanel(QWidget):
             item.setToolTip(COL_NAME, str(path))
             item.setData(0, Qt.ItemDataRole.UserRole, (path, kind))
             self._tree.addTopLevelItem(item)
-            self._request_item_metadata(item, path, kind)
+            # The item itself (not a row index) is captured -- sorting can
+            # reorder rows while a probe is still in flight. LOW priority:
+            # anything the user explicitly asks for jumps ahead of these.
+            media_info.request(path, lambda info, item=item: self._on_metadata_ready(item, info),
+                               kind=kind, priority=LOW, group=_PROBE_GROUP)
         self._tree.setSortingEnabled(True)
         log.info("Bin: %d items", len(self._items))
 
-    def _request_item_metadata(self, item: QTreeWidgetItem, path: Path, kind: str):
-        cache_key = _metadata_cache_key(path)
-        cached = _METADATA_CACHE.get(cache_key) if cache_key is not None else None
-        if cached is not None:
-            _METADATA_CACHE.move_to_end(cache_key)
-            self._on_metadata_ready(item, *cached)
-            return
-
-        def on_done(_item: QTreeWidgetItem, duration_s: float, width: int, height: int):
-            if cache_key is not None and (duration_s > 0 or width or height):
-                _METADATA_CACHE[cache_key] = (duration_s, width, height)
-                _METADATA_CACHE.move_to_end(cache_key)
-                while len(_METADATA_CACHE) > _METADATA_CACHE_MAX:
-                    _METADATA_CACHE.popitem(last=False)
-            self._on_metadata_ready(_item, duration_s, width, height)
-
-        # The item itself (not a row index) is the key -- sorting can
-        # reorder rows any time after this, including while a probe for
-        # an earlier-added item is still in flight.
-        request_metadata(item, path, kind, on_done)
-
     @staticmethod
-    def _on_metadata_ready(item: QTreeWidgetItem, duration_s: float, width: int, height: int):
+    def _on_metadata_ready(item: QTreeWidgetItem, info: media_info.MediaInfo):
         try:
-            item.setText(COL_DURATION, _fmt_duration(duration_s) if duration_s > 0 else "--")
-            item.setText(COL_RESOLUTION, f"{width}x{height}" if width and height else "--")
+            item.setText(COL_DURATION, _fmt_duration(info.duration_s) if info.duration_s > 0 else "--")
+            item.setText(COL_RESOLUTION, f"{info.width}x{info.height}" if info.width and info.height else "--")
         except RuntimeError:
             pass  # item's row was cleared (e.g. Bin refreshed) before its probe returned
 

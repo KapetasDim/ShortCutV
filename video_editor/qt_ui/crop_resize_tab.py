@@ -1,27 +1,26 @@
 from __future__ import annotations
 
-import threading
 from pathlib import Path
 from typing import Optional
 
 from PIL import Image
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QCoreApplication, Qt
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
                                 QPushButton, QSplitter, QVBoxLayout, QWidget)
 
-from .. import ffmpeg_ops
 from ..crop_box import ASPECT_RATIO_LABELS, ASPECT_RATIO_VALUES
 from ..logging_config import get_logger
+from ..media_types import IMAGE_EXTS, VIDEO_EXTS
 from .crop_widgets import CropCanvas
 from .dialogs import ask_directory
 from .icons import icon
 from .theme import COLORS
-from .util import connect_button, run_on_ui
+from .job_queue import HIGH, JobHandle, submit
+from .util import connect_button
 from .widgets import ScrollableFrame, bytes_to_image
+from .worker_client import WorkerJob
 
 log = get_logger()
-
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif", ".bmp"}
 
 
 class CropResizeTab(QWidget):
@@ -33,6 +32,8 @@ class CropResizeTab(QWidget):
         self._output_dir: Optional[Path] = None
         self._checks: dict[str, QCheckBox] = {}
         self._files: list[Path] = []
+        self._preview_job: Optional[JobHandle] = None
+        self._run_job: Optional[WorkerJob] = None
 
         self._build_ui()
 
@@ -171,7 +172,7 @@ class CropResizeTab(QWidget):
             return
         self._files = sorted(
             p for p in self._input_dir.iterdir()
-            if p.suffix.lower() == ".mp4" or p.suffix.lower() in IMAGE_EXTS
+            if p.suffix.lower() in VIDEO_EXTS or p.suffix.lower() in IMAGE_EXTS
         )
         self._checklist.clear()
         self._checks = {}
@@ -189,16 +190,32 @@ class CropResizeTab(QWidget):
         self._crop_canvas.set_aspect_ratio(ratio)
 
     def _load_preview_frame(self, path: Path):
-        try:
-            if path.suffix.lower() == ".mp4":
-                probe_frame = ffmpeg_ops.extract_thumbnail(path, 0.0, out_w=1200, timeout=2)
-                if probe_frame:
-                    self._crop_canvas.set_image(bytes_to_image(probe_frame))
-            else:
+        if self._preview_job is not None:
+            self._preview_job.cancel()
+            self._preview_job = None
+        if path.suffix.lower() not in VIDEO_EXTS:
+            try:
                 self._crop_canvas.set_image(Image.open(path))
-        except Exception:
-            log.exception("Crop/Resize: failed to load preview frame for %s", path)
-            self._status_lbl.setText(f"Could not preview {path.name} (see log).")
+            except Exception:
+                log.exception("Crop/Resize: failed to load preview frame for %s", path)
+                self._status_lbl.setText(f"Could not preview {path.name} (see log).")
+            return
+
+        # Async (job_queue/QProcess) -- this used to be a blocking ffmpeg
+        # call on the GUI thread every time a folder was picked.
+        def done(_code: int, data: bytes):
+            self._preview_job = None
+            if not data:
+                self._status_lbl.setText(f"Could not preview {path.name} (see log).")
+                return
+            try:
+                self._crop_canvas.set_image(bytes_to_image(data))
+            except Exception:
+                log.exception("Crop/Resize: failed to decode preview frame for %s", path)
+
+        self._preview_job = submit("ffmpeg", ["-v", "error", "-ss", "0", "-i", str(path), "-frames:v", "1",
+                                              "-vf", "scale=1200:-2", "-f", "image2pipe", "-vcodec", "png",
+                                              "pipe:1"], done, HIGH)
 
     # ---------------------------------------------------------------- run --
 
@@ -219,49 +236,50 @@ class CropResizeTab(QWidget):
             self._status_lbl.setText("Target W/H must be integers.")
             return
 
-        videos = [f for f in selected if f.suffix.lower() == ".mp4"]
+        videos = [f for f in selected if f.suffix.lower() in VIDEO_EXTS]
         images = [f for f in selected if f.suffix.lower() in IMAGE_EXTS]
 
         self._run_btn.setEnabled(False)
         self._progress.setValue(0)
         self._status_lbl.setText("Running...")
+        log.info("Crop/Resize batch start: %d videos, %d images", len(videos), len(images))
 
-        def on_progress(frac, msg):
-            run_on_ui(lambda: (self._progress.setValue(int(frac * 100)), self._status_lbl.setText(msg)))
+        job = WorkerJob("crop_resize", {
+            "videos": [str(v) for v in videos], "images": [str(i) for i in images],
+            "output_dir": str(self._output_dir), "crop_fractions": list(crop_fractions),
+            "target_w": tw, "target_h": th},
+            # Parented to the app, not this dialog: closing the dialog lets the
+            # batch finish in the background, as it always has.
+            parent=QCoreApplication.instance())
+        self._run_job = job
+        job.progress.connect(lambda frac, msg: (self._progress.setValue(int(frac * 100)),
+                                                self._status_lbl.setText(msg)))
+        job.finished.connect(lambda result: self._on_run_done(len(selected), result))
+        job.start()
 
-        def run():
-            log.info("Crop/Resize batch start: %d videos, %d images", len(videos), len(images))
-            failed = []
-            if videos:
-                try:
-                    ffmpeg_ops.run_crop_resize(videos, self._output_dir, crop_fractions, (tw, th), on_progress)
-                except Exception:
-                    log.exception("Crop/Resize: video batch failed")
-                    failed.extend(f.name for f in videos)
-            for img_path in images:
-                try:
-                    self._crop_resize_image(img_path, crop_fractions, tw, th)
-                except Exception:
-                    log.exception("Crop/Resize: failed to process image %s", img_path)
-                    failed.append(img_path.name)
-            done_msg = f"Done. {len(selected) - len(failed)}/{len(selected)} file(s) processed."
-            if failed:
-                done_msg += f" Failed: {', '.join(failed[:5])}{'...' if len(failed) > 5 else ''} (see log)."
-            run_on_ui(lambda: (self._status_lbl.setText(done_msg), self._run_btn.setEnabled(True)))
-            log.info("Crop/Resize batch done (%d failed)", len(failed))
+    def _on_run_done(self, n_selected: int, result: dict):
+        log.info("Crop/Resize batch done: %s", result)
+        try:
+            self._show_run_result(n_selected, result)
+        except RuntimeError:
+            pass  # dialog was closed while the batch ran
 
-        threading.Thread(target=run, daemon=True).start()
+    def _show_run_result(self, n_selected: int, result: dict):
+        self._run_job = None
+        self._run_btn.setEnabled(True)
+        if result.get("cancelled"):
+            self._status_lbl.setText("Cancelled.")
+            return
+        failed = result.get("failed", [])
+        processed = result.get("processed", 0 if result.get("error") else n_selected - len(failed))
+        msg = f"Done. {processed}/{n_selected} file(s) processed."
+        if failed:
+            msg += f" Failed: {', '.join(failed[:5])}{'...' if len(failed) > 5 else ''} (see log)."
+        elif result.get("error"):
+            msg = f"Failed: {result['error']}"
+        self._status_lbl.setText(msg)
 
-    def _crop_resize_image(self, path: Path, crop_fractions, tw, th):
-        top_f, bottom_f, left_f, right_f = crop_fractions
-        img = Image.open(path)
-        w, h = img.size
-        top, bottom = round(top_f * h), round(bottom_f * h)
-        left, right = round(left_f * w), round(right_f * w)
-        cw, ch = w - left - right, h - top - bottom
-        img = img.crop((left, top, left + cw, top + ch))
-        out_w = tw if tw else cw
-        out_h = th if th else ch
-        img = img.resize((out_w, out_h), Image.LANCZOS)
-        img.save(self._output_dir / path.name)
-        log.info("Cropped image %s -> %dx%d", path.name, out_w, out_h)
+    def teardown(self):
+        if self._preview_job is not None:
+            self._preview_job.cancel()
+            self._preview_job = None

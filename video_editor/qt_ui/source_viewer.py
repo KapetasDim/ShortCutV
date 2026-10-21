@@ -4,22 +4,21 @@ clip/frame straight from the source file. Replaces the old Clip Exporter tab
 (folder/video pickers are gone -- selection now comes from the Bin panel)."""
 from __future__ import annotations
 
-import threading
 from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton, QVBoxLayout, QWidget
 
-from .. import ffmpeg_ops
 from ..logging_config import get_logger
 from .crop_resize_tab import CropResizeTab
 from .dialogs import ask_save_filename
 from .icons import icon
 from .player import SharedPlayer
 from .theme import COLORS
-from .util import connect_button, run_on_ui
+from .util import connect_button
 from .widgets import RangeSlider, fmt_time
+from .worker_client import WorkerJob
 
 log = get_logger()
 
@@ -32,6 +31,7 @@ class SourceViewerPanel(QWidget):
         self.player = player
         self._path: Optional[Path] = None
         self._kind: str = "video"
+        self._jobs: list[WorkerJob] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -180,20 +180,25 @@ class SourceViewerPanel(QWidget):
                            initialfile=default_name, filetypes=[("MP4 video", "*.mp4")])
 
     def _run_export_clip(self, in_s, out_s, out_path):
-        path = self._path
         self._export_btn.setEnabled(False)
         self._progress.setValue(0)
         self._status_lbl.setText("Exporting...")
+        self._start_job("export_clip", {"path": str(self._path), "in_s": in_s, "out_s": out_s,
+                                        "output": str(out_path)}, out_path, self._export_btn)
 
-        def on_progress(frac, _label):
-            run_on_ui(lambda: self._progress.setValue(int(frac * 100)))
+    def _start_job(self, kind: str, params: dict, out_path: Path, button):
+        job = WorkerJob(kind, params, parent=self)
+        self._jobs.append(job)
+        job.progress.connect(lambda frac, _msg: self._progress.setValue(int(frac * 100)))
+        job.finished.connect(lambda result: self._on_job_done(job, out_path, button, result))
+        job.start()
 
-        def run():
-            ok = ffmpeg_ops.export_clip(path, in_s, out_s, out_path, on_progress)
-            run_on_ui(lambda: (self._status_lbl.setText(f"Saved: {out_path.name}" if ok else "Export failed"),
-                                self._export_btn.setEnabled(True)))
-
-        threading.Thread(target=run, daemon=True).start()
+    def _on_job_done(self, job: WorkerJob, out_path: Path, button, result: dict):
+        if job in self._jobs:
+            self._jobs.remove(job)
+        button.setEnabled(True)
+        if not result.get("cancelled"):
+            self._status_lbl.setText(f"Saved: {out_path.name}" if result.get("ok") else "Export failed")
 
     def _export_frame(self):
         if self._path is None:
@@ -216,16 +221,10 @@ class SourceViewerPanel(QWidget):
                            initialfile=default_name, filetypes=[("PNG image", "*.png")])
 
     def _run_export_frame(self, pos_s, out_path):
-        path = self._path
         self._frame_btn.setEnabled(False)
         self._status_lbl.setText("Exporting frame...")
-
-        def run():
-            ok = ffmpeg_ops.export_frame(path, pos_s, out_path)
-            run_on_ui(lambda: (self._status_lbl.setText(f"Saved: {out_path.name}" if ok else "Export failed"),
-                                self._frame_btn.setEnabled(True)))
-
-        threading.Thread(target=run, daemon=True).start()
+        self._start_job("export_frame", {"path": str(self._path), "pos_s": pos_s, "output": str(out_path)},
+                        out_path, self._frame_btn)
 
 
 class BatchCropResizeDialog(QDialog):
@@ -245,6 +244,7 @@ class BatchCropResizeDialog(QDialog):
         close_row.addStretch(1)
         close_btn = QPushButton("Close")
         connect_button(close_btn.clicked, "Batch Crop/Resize > Close", self.accept)
+        self.finished.connect(lambda _code: self._tab.teardown())
         close_row.addWidget(close_btn)
         layout.addLayout(close_row)
 

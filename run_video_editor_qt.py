@@ -1,9 +1,32 @@
+import lzma
 import os
 import sys
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _ensure_libmpv():
+    """libmpv-2.dll is ~115MB -- over GitHub's 100MB file limit -- so the repo
+    stores it xz-compressed (~31MB) and it's unpacked here on first launch.
+    Written to a temp name and renamed, so an interrupted unpack never leaves
+    a truncated DLL that would then fail to load on every later launch."""
+    dll = os.path.join(_HERE, "libmpv-2.dll")
+    packed = dll + ".xz"
+    if os.path.exists(dll) or not os.path.exists(packed):
+        return
+    print("First launch: unpacking libmpv-2.dll...", flush=True)
+    tmp = dll + ".tmp"
+    with lzma.open(packed, "rb") as src, open(tmp, "wb") as dst:
+        while chunk := src.read(8 * 1024 * 1024):
+            dst.write(chunk)
+    os.replace(tmp, dll)
+
+
+_ensure_libmpv()
+
 # libmpv-2.dll lives next to this script; python-mpv only looks in %PATH% or
 # its own package folder, so add this script's directory to PATH before import.
-os.environ["PATH"] = os.path.dirname(os.path.abspath(__file__)) + os.pathsep + os.environ["PATH"]
+os.environ["PATH"] = _HERE + os.pathsep + os.environ["PATH"]
 
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication

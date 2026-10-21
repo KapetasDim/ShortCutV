@@ -1,19 +1,19 @@
 from __future__ import annotations
 
+import dataclasses
 import io
 import tempfile
-import threading
 import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
 from PIL import Image
-from PySide6.QtCore import QObject, QProcess, Qt
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QMouseEvent, QPainter, QPaintEvent, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
                                 QProgressBar, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
 
-from .. import ffmpeg_ops, fonts_catalog, text_render
+from .. import fonts_catalog, text_render
 from ..crop_box import CropBoxController
 from ..curves import CURVE_PRESETS, eval_curve, fade_opacity
 from ..logging_config import get_logger
@@ -23,8 +23,10 @@ from .icons import icon
 from .inspector_split import make_preview_splitter
 from .player import SharedPlayer
 from .theme import COLORS
-from .util import connect_button, run_on_ui
+from .job_queue import HIGH, submit
+from .util import connect_button
 from .widgets import InlineColorPicker, Scrubber, pil_to_qpixmap
+from .worker_client import WorkerJob
 
 log = get_logger()
 
@@ -58,6 +60,7 @@ class TextOverlayEditor(QWidget):
         self._baked = False
         self.player: Optional[SharedPlayer] = None
         self._last_bake_path: Optional[Path] = None
+        self._bake_job: Optional[WorkerJob] = None
         self._tmp_dir = Path(tempfile.gettempdir()) / "video_editor_text_preview"
         self._tmp_dir.mkdir(exist_ok=True)
         self._param_edits: dict[str, QLineEdit] = {}
@@ -411,6 +414,12 @@ class TextOverlayEditor(QWidget):
             self._outline_color_btn.setStyleSheet(f"background-color: {hex_color};")
         self._on_field_change()
 
+    def set_start(self, start_s: float):
+        """Called after this overlay was dragged on the timeline while this
+        editor is open, so a later Update doesn't write the stale pre-drag
+        start back over the move."""
+        self._start_edit.setText(f"{start_s:.2f}")
+
     def _use_current_time(self):
         self._start_edit.setText(f"{self.preview_player.current_pos_s():.2f}")
         self._grab_frame()
@@ -585,20 +594,25 @@ class TextOverlayEditor(QWidget):
         self._bake_progress.setValue(0)
         self._bake_status_lbl.setText("Rendering...")
 
-        def on_progress(frac, _label):
-            run_on_ui(lambda: self._bake_progress.setValue(int(frac * 100)))
+        if self._bake_job is not None:
+            self._bake_job.cancel()
+        job = WorkerJob("bake_text", {"source": str(source_path), "overlay": dataclasses.asdict(overlay),
+                                      "canvas_w": self.project.canvas_w, "canvas_h": self.project.canvas_h,
+                                      "output": str(out_path), "preview_height": preview_height}, parent=self)
+        self._bake_job = job
+        job.progress.connect(lambda frac, _msg: self._bake_progress.setValue(int(frac * 100)))
+        job.finished.connect(lambda result: self._on_bake_finished(job, out_path, overlay.text, result))
+        job.start()
 
-        def run():
-            try:
-                ok = ffmpeg_ops.render_text_overlay_preview(
-                    source_path, overlay, self.project.canvas_w, self.project.canvas_h, out_path,
-                    preview_height=preview_height, progress_cb=on_progress)
-            except Exception:
-                log.exception("Text overlay editor: bake failed for overlay '%s'", overlay.text)
-                ok = False
-            run_on_ui(lambda: self._on_bake_done(ok, out_path, overlay.text))
-
-        threading.Thread(target=run, daemon=True).start()
+    def _on_bake_finished(self, job: WorkerJob, out_path: Path, overlay_text: str, result: dict):
+        if job is not self._bake_job:
+            self._delete_bake_file(out_path)
+            return
+        self._bake_job = None
+        if result.get("cancelled"):
+            self._delete_bake_file(out_path)
+            return
+        self._on_bake_done(bool(result.get("ok")), out_path, overlay_text)
 
     def _on_bake_done(self, ok: bool, out_path, overlay_text: str):
         self._bake_btn.setEnabled(True)
@@ -685,6 +699,9 @@ class TextOverlayEditor(QWidget):
         for job in list(self._grab_jobs):
             job.cancel()
         self._grab_jobs.clear()
+        if self._bake_job is not None:
+            self._bake_job.cancel()
+            self._bake_job = None
         if self.player is not None:
             self.player.terminate()
             self.player = None
@@ -755,40 +772,14 @@ class _BoxPreviewArea(QWidget):
         self.setCursor(cursor)
 
 
-class _FrameGrabJob(QObject):
-    """Runs one ffmpeg full-res frame grab asynchronously via QProcess (see
-    _grab_frame's docstring for why this isn't a blocking subprocess.run
-    call, or a raw background thread, on this class's own GUI thread)."""
+class _FrameGrabJob:
+    """One full-res frame grab from the composed preview, run through the
+    shared job_queue at HIGH priority (it's directly user-triggered)."""
 
     def __init__(self, path: str, pos_s: float, on_done: Callable[["_FrameGrabJob", float, bytes], None]):
-        super().__init__()
-        self._pos_s = pos_s
-        self._on_done = on_done
-        self._cancelled = False
-        self._stdout = bytearray()
-        self._proc = QProcess(self)
-        # A full-res PNG frame on stdout, plus ffmpeg's own banner/log on
-        # stderr, both routinely exceed the OS pipe buffer (~64KB on
-        # Windows). Reading only in _on_finished deadlocks ffmpeg the moment
-        # either pipe fills, since it then blocks on write() and can never
-        # reach exit -- so both channels must be drained as data arrives
-        # instead of waiting for the process to finish.
-        self._proc.readyReadStandardOutput.connect(self._on_stdout_ready)
-        self._proc.readyReadStandardError.connect(self._proc.readAllStandardError)
-        self._proc.finished.connect(self._on_finished)
-        self._proc.start("ffmpeg", ["-y", "-ss", str(pos_s), "-i", path,
-                                     "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"])
+        self._handle = submit("ffmpeg", ["-v", "error", "-ss", str(pos_s), "-i", path, "-frames:v", "1",
+                                         "-f", "image2pipe", "-vcodec", "png", "pipe:1"],
+                              lambda _code, data: on_done(self, pos_s, data), HIGH)
 
     def cancel(self):
-        self._cancelled = True
-        if self._proc.state() != QProcess.ProcessState.NotRunning:
-            self._proc.kill()
-
-    def _on_stdout_ready(self):
-        self._stdout += bytes(self._proc.readAllStandardOutput())
-
-    def _on_finished(self, _exit_code, _status):
-        if self._cancelled:
-            return
-        self._on_stdout_ready()
-        self._on_done(self, self._pos_s, bytes(self._stdout))
+        self._handle.cancel()

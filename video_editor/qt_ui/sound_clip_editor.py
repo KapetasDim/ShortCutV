@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
 import tempfile
-import threading
 import uuid
 from pathlib import Path
 from typing import Callable, Optional
@@ -10,16 +10,17 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
                                 QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
-from .. import ffmpeg_ops
 from ..logging_config import get_logger
 from ..project import SoundClip, TimelineProject
 from .icons import icon
 from .inspector_split import make_preview_splitter
-from .metadata_worker import request_metadata
+from . import media_info
+from .job_queue import HIGH
 from .player import SharedPlayer
 from .theme import COLORS
-from .util import connect_button, run_on_ui
+from .util import connect_button
 from .widgets import Scrubber
+from .worker_client import WorkerJob
 
 log = get_logger()
 
@@ -43,6 +44,7 @@ class SoundClipEditor(QWidget):
         self._baked = False
         self.player: Optional[SharedPlayer] = None
         self._last_bake_path: Optional[Path] = None
+        self._bake_job: Optional[WorkerJob] = None
         self._duration_user_edited = False
         self._tmp_dir = Path(tempfile.gettempdir()) / "video_editor_sound_preview"
         self._tmp_dir.mkdir(exist_ok=True)
@@ -235,16 +237,22 @@ class SoundClipEditor(QWidget):
         if not path.exists():
             return
 
-        def on_probe(_key, duration_s, _width, _height):
-            if self._duration_user_edited or duration_s <= 0:
+        def on_probe(info: media_info.MediaInfo):
+            if self._duration_user_edited or info.duration_s <= 0:
                 return
-            self._clip_duration_edit.setText(f"{max(0.05, duration_s):.2f}")
+            self._clip_duration_edit.setText(f"{max(0.05, info.duration_s):.2f}")
 
-        request_metadata(self.source, path, "sound", on_probe)
+        media_info.request(path, on_probe, kind="sound", priority=HIGH)
 
     def _on_infinite_toggled(self, *_args):
         self._repeat_edit.setEnabled(not self._repeat_infinite_check.isChecked())
         self._on_field_change()
+
+    def set_start(self, start_s: float):
+        """Called after this sound was dragged on the timeline while this
+        editor is open, so a later Update doesn't write the stale pre-drag
+        start back over the move."""
+        self._start_edit.setText(f"{start_s:.2f}")
 
     def _use_current_time(self):
         self._start_edit.setText(f"{self.preview_player.current_pos_s():.2f}")
@@ -296,19 +304,25 @@ class SoundClipEditor(QWidget):
         self._bake_progress.setValue(0)
         self._bake_status_lbl.setText("Rendering...")
 
-        def on_progress(frac, _label):
-            run_on_ui(lambda: self._bake_progress.setValue(int(frac * 100)))
+        if self._bake_job is not None:
+            self._bake_job.cancel()
+        job = WorkerJob("bake_sound", {"source": str(source_path), "sound": dataclasses.asdict(sound),
+                                       "output": str(out_path), "preview_height": preview_height},
+                        parent=self)
+        self._bake_job = job
+        job.progress.connect(lambda frac, _msg: self._bake_progress.setValue(int(frac * 100)))
+        job.finished.connect(lambda result: self._on_bake_finished(job, out_path, result))
+        job.start()
 
-        def run():
-            try:
-                ok = ffmpeg_ops.render_sound_clip_preview(
-                    source_path, sound, out_path, preview_height=preview_height, progress_cb=on_progress)
-            except Exception:
-                log.exception("Sound clip editor: bake failed for %s", self.source)
-                ok = False
-            run_on_ui(lambda: self._on_bake_done(ok, out_path))
-
-        threading.Thread(target=run, daemon=True).start()
+    def _on_bake_finished(self, job: WorkerJob, out_path: Path, result: dict):
+        if job is not self._bake_job:
+            self._delete_bake_file(out_path)
+            return
+        self._bake_job = None
+        if result.get("cancelled"):
+            self._delete_bake_file(out_path)
+            return
+        self._on_bake_done(bool(result.get("ok")), out_path)
 
     def _on_bake_done(self, ok: bool, out_path: Path):
         self._bake_btn.setEnabled(True)
@@ -395,6 +409,9 @@ class SoundClipEditor(QWidget):
         self.on_close()
 
     def teardown(self):
+        if self._bake_job is not None:
+            self._bake_job.cancel()
+            self._bake_job = None
         if self.player is not None:
             self.player.terminate()
             self.player = None

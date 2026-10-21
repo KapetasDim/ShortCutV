@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import dataclasses
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -9,6 +11,11 @@ from .logging_config import get_logger
 log = get_logger()
 
 DEFAULT_TRANSITION_DURATION = 0.25
+
+# Bumped whenever the on-disk layout changes in a way load_project() has to
+# translate. Files written before versioning existed have no "version" key and
+# are treated as version 1.
+PROJECT_FILE_VERSION = 1
 
 
 @dataclass
@@ -131,9 +138,7 @@ class TimelineProject:
     text_overlays: list[TextOverlay] = field(default_factory=list)
     sound_clips: list[SoundClip] = field(default_factory=list)
     # The library's clip/sound source folders, saved per-project so reopening
-    # a project restores exactly what it was scanning -- separate from
-    # AppState.clip_input_dir/clip_output_dir, which just seed a *new*
-    # project's defaults (see TimelineTab.apply_chained_defaults).
+    # a project restores exactly what it was scanning.
     lib_input_dir: str | None = None
     lib_output_dir: str | None = None
     # Fade-in-from-black (or wipe/slide-in) before the first clip; "cut" = start instantly.
@@ -146,47 +151,75 @@ class TimelineProject:
     outro_transition_direction: str = "left"
 
 
+def _from_dict(cls, data: dict, what: str):
+    """Builds `cls` from a JSON dict, tolerating keys this version doesn't
+    know (a file saved by a newer build, or a field that was since removed)
+    instead of crashing the whole load on TypeError. Unknown keys are logged
+    and dropped; a missing *required* field is still an error, reported with
+    which item it was rather than a bare constructor TypeError."""
+    known = {f.name for f in dataclasses.fields(cls)}
+    unknown = sorted(set(data) - known)
+    if unknown:
+        log.warning("Project load: ignoring unknown %s field(s): %s", what, ", ".join(unknown))
+    required = {f.name for f in dataclasses.fields(cls)
+                if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING}
+    missing = sorted(required - set(data))
+    if missing:
+        raise ValueError(f"{what} is missing required field(s): {', '.join(missing)}")
+    return cls(**{k: v for k, v in data.items() if k in known})
+
+
+def clip_from_dict(data: dict) -> TimelineClip:
+    return _from_dict(TimelineClip, data, "clip")
+
+
+def overlay_from_dict(data: dict) -> TextOverlay:
+    return _from_dict(TextOverlay, data, "text overlay")
+
+
+def sound_from_dict(data: dict) -> SoundClip:
+    return _from_dict(SoundClip, data, "sound clip")
+
+
+def project_to_dict(project: TimelineProject) -> dict:
+    data = asdict(project)
+    data["version"] = PROJECT_FILE_VERSION
+    return data
+
+
+def project_from_dict(data: dict) -> TimelineProject:
+    version = data.get("version", 1)
+    if version > PROJECT_FILE_VERSION:
+        log.warning("Project load: file version %s is newer than this build (%s) -- loading what it can",
+                    version, PROJECT_FILE_VERSION)
+    top = {k: v for k, v in data.items() if k not in ("clips", "text_overlays", "sound_clips", "version")}
+    project = _from_dict(TimelineProject, top, "project")
+    project.clips = [clip_from_dict(c) for c in data.get("clips", [])]
+    project.text_overlays = [overlay_from_dict(t) for t in data.get("text_overlays", [])]
+    project.sound_clips = [sound_from_dict(s) for s in data.get("sound_clips", [])]
+    return project
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Writes to a sibling temp file, then renames it over `path`. A crash,
+    full disk, or locked file mid-write leaves the previous file intact
+    instead of a truncated one -- os.replace is atomic on the same volume."""
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def save_project(project: TimelineProject, path: Path) -> None:
-    data = {
-        "canvas_w": project.canvas_w,
-        "canvas_h": project.canvas_h,
-        "clips": [asdict(c) for c in project.clips],
-        "text_overlays": [asdict(t) for t in project.text_overlays],
-        "sound_clips": [asdict(s) for s in project.sound_clips],
-        "lib_input_dir": project.lib_input_dir,
-        "lib_output_dir": project.lib_output_dir,
-        "intro_transition_type": project.intro_transition_type,
-        "intro_transition_duration": project.intro_transition_duration,
-        "intro_transition_direction": project.intro_transition_direction,
-        "outro_transition_type": project.outro_transition_type,
-        "outro_transition_duration": project.outro_transition_duration,
-        "outro_transition_direction": project.outro_transition_direction,
-    }
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    write_text_atomic(path, json.dumps(project_to_dict(project), indent=2))
     log.info("Saved project: %s (%d clips, %d text overlays, %d sound clips)",
-              path.name, len(project.clips), len(project.text_overlays), len(project.sound_clips))
+             path.name, len(project.clips), len(project.text_overlays), len(project.sound_clips))
 
 
 def load_project(path: Path) -> TimelineProject:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    clips = [TimelineClip(**c) for c in data.get("clips", [])]
-    text_overlays = [TextOverlay(**t) for t in data.get("text_overlays", [])]
-    sound_clips = [SoundClip(**s) for s in data.get("sound_clips", [])]
-    project = TimelineProject(
-        clips=clips,
-        canvas_w=data.get("canvas_w", 1080),
-        canvas_h=data.get("canvas_h", 1920),
-        text_overlays=text_overlays,
-        sound_clips=sound_clips,
-        lib_input_dir=data.get("lib_input_dir"),
-        lib_output_dir=data.get("lib_output_dir"),
-        intro_transition_type=data.get("intro_transition_type", "cut"),
-        intro_transition_duration=data.get("intro_transition_duration", DEFAULT_TRANSITION_DURATION),
-        intro_transition_direction=data.get("intro_transition_direction", "left"),
-        outro_transition_type=data.get("outro_transition_type", "cut"),
-        outro_transition_duration=data.get("outro_transition_duration", DEFAULT_TRANSITION_DURATION),
-        outro_transition_direction=data.get("outro_transition_direction", "left"),
-    )
+    project = project_from_dict(json.loads(path.read_text(encoding="utf-8")))
     log.info("Loaded project: %s (%d clips, %d text overlays, %d sound clips)",
-              path.name, len(project.clips), len(project.text_overlays), len(project.sound_clips))
+             path.name, len(project.clips), len(project.text_overlays), len(project.sound_clips))
     return project
